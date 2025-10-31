@@ -10,7 +10,8 @@ const fs = require('fs');
 const dotenv = require('dotenv');
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 5000;
+
 
 dotenv.config();
 
@@ -596,4 +597,4 @@ app.put('/change-mobile', async (req, res) => {
 // =============================
 // START SERVER
 // =============================
-app.listen(port, () => console.log(`🚀 Server running on http://localhost:${port}`));
+app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
