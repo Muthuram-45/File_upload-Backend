@@ -7,11 +7,12 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const dotenv = require('dotenv');
 
 const app = express();
 const port = 5000;
 
-require('dotenv').config();
+dotenv.config();
 
 
 const admin = require('firebase-admin');
