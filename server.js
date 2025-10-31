@@ -16,7 +16,8 @@ dotenv.config();
 
 
 const admin = require('firebase-admin');
-const serviceAccount = require('./firebase-service-account.json');
+// const serviceAccount = require('./firebase-service-account.json');
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 // ✅ Initialize Firebase Admin
 admin.initializeApp({
