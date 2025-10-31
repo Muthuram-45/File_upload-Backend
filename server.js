@@ -62,6 +62,11 @@ db.connect((err) => {
   console.log('✅ Connected to MySQL Database');
 });
 
+app.get("/", (req, res) => {
+  res.send("✅ Backend is live!");
+});
+
+
 // =============================
 // Multer (for File Upload)
 // =============================
