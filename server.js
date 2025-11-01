@@ -91,59 +91,52 @@ const upload = multer({ storage });
 app.use('/uploads', express.static(uploadDir));
 
 // =============================
-// EMAIL (OTP) SETUP
+// Nodemailer Setup
 // =============================
-
-const otpStore = {}; // ✅ Make sure this is globally accessible (above all routes)
-
-// 🔹 Use your Gmail App Password (not your real Gmail password)
 const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // must be false for port 587
+  service: 'gmail',
   auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  }
+    user: 'muthuram921@gmail.com',
+    pass: 'fdaa kqvq eeuq bzfx',
+  },
 });
 
-// 🔹 OTP Generator Function
+transporter.verify((error, success) => {
+  if (error) console.error('❌ Gmail SMTP Error:', error);
+  else console.log('✅ Gmail SMTP is ready to send emails');
+});
+
+// =============================
+// OTP Store (Temporary Memory)
+// =============================
+let otpStore = {}; // { email: { otp, expires } }
+
 function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
+  return Math.floor(100000 + Math.random() * 900000);
 }
 
 // =============================
-// SEND OTP
+// SEND OTP to Gmail
 // =============================
 app.post('/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email)
-      return res.status(400).json({ success: false, error: 'Email is required' });
+    if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
 
     const otp = generateOtp();
-    otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 }; // 5 min expiry
+    otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 };
 
     const mailOptions = {
-      from: process.env.MAIL_USER,
+      from: 'muthuram921@gmail.com',
       to: email,
       subject: 'Your OTP Verification Code',
-      html: `
-        <div style="font-family:sans-serif;">
-          <h3>Your OTP is:</h3>
-          <h1 style="color:#2E86C1;">${otp}</h1>
-          <p>This OTP is valid for 5 minutes.</p>
-        </div>
-      `,
+      html: `<h3>Your OTP is:</h3><h1>${otp}</h1><p>Valid for 5 minutes.</p>`,
     };
 
     await transporter.sendMail(mailOptions);
-
-    console.log(`✅ OTP ${otp} sent to ${email}`);
-    res.json({ success: true, message: 'OTP sent successfully to Gmail' });
+    res.json({ success: true, message: '✅ OTP sent successfully to your Gmail' });
   } catch (err) {
-    console.error('❌ Error sending OTP:', err.message);
-    res.status(500).json({ success: false, error: 'Failed to send OTP. Please try again.' });
+    res.status(500).json({ success: false, error: 'Failed to send OTP' });
   }
 });
 
@@ -151,30 +144,48 @@ app.post('/send-otp', async (req, res) => {
 // VERIFY OTP
 // =============================
 app.post('/verify-otp', (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp)
-      return res.status(400).json({ success: false, error: 'Email and OTP required' });
+  const { email, otp } = req.body;
+  if (!email || !otp)
+    return res.status(400).json({ success: false, error: 'Email and OTP required' });
 
-    const record = otpStore[email];
-    if (!record)
-      return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+  const record = otpStore[email];
+  if (!record) return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+  if (Date.now() > record.expires) return res.status(400).json({ success: false, error: 'OTP expired' });
 
-    if (Date.now() > record.expires)
-      return res.status(400).json({ success: false, error: 'OTP expired' });
+  if (String(record.otp) !== String(otp))
+    return res.status(400).json({ success: false, error: 'Invalid OTP' });
 
-    if (String(record.otp) !== String(otp))
-      return res.status(400).json({ success: false, error: 'Invalid OTP' });
-
-    delete otpStore[email];
-    console.log(`✅ OTP verified for ${email}`);
-    res.json({ success: true, message: 'OTP verified successfully' });
-  } catch (err) {
-    console.error('❌ OTP Verification Error:', err.message);
-    res.status(500).json({ success: false, error: 'Server error during OTP verification' });
-  }
+  delete otpStore[email];
+  res.json({ success: true, message: '✅ OTP verified successfully' });
 });
 
+// =============================
+// REGISTER USER
+// =============================
+app.post('/register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, mobile, password, company_name } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ success: false, error: 'Email and password required' });
+
+    const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+    if (existing.length > 0)
+      return res.status(400).json({ success: false, error: 'User already registered' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await db
+      .promise()
+      .query(
+        'INSERT INTO users (first_name, last_name, email, mobile, password, company_name) VALUES (?, ?, ?, ?, ?, ?)',
+        [firstName, lastName, email, mobile || '', hashedPassword, company_name || null]
+      );
+
+    res.json({ success: true, message: '✅ User registered successfully' });
+  } catch (err) {
+    console.error('❌ Register Error:', err);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
 // =============================
 // REGISTER USER
 // =============================
