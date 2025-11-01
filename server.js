@@ -98,11 +98,13 @@ const otpStore = {}; // ✅ Make sure this is globally accessible (above all rou
 
 // 🔹 Use your Gmail App Password (not your real Gmail password)
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: "smtp.gmail.com",
+  port: 465,
+  secure: true,
   auth: {
-     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS, // ⚠️ Replace with your Gmail App Password
-  },
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_PASS,
+  }
 });
 
 // 🔹 OTP Generator Function
@@ -123,7 +125,7 @@ app.post('/send-otp', async (req, res) => {
     otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 }; // 5 min expiry
 
     const mailOptions = {
-      from: 'muthuram921@gmail.com',
+      from: process.env.MAIL_USER,
       to: email,
       subject: 'Your OTP Verification Code',
       html: `
