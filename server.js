@@ -63,12 +63,12 @@ const db = mysql.createPool({
 });
 module.exports = db;
 
-db.connect((err) => {
+db.query('SELECT 1', (err) => {
   if (err) {
     console.error('❌ MySQL connection failed:', err);
     process.exit(1);
   }
-  console.log('✅ Connected to MySQL Database');
+  console.log('✅ MySQL pool connected successfully');
 });
 
 app.get("/", (req, res) => {
