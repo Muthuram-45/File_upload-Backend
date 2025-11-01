@@ -82,52 +82,57 @@ const upload = multer({ storage });
 app.use('/uploads', express.static(uploadDir));
 
 // =============================
-// Nodemailer Setup
+// EMAIL (OTP) SETUP
 // =============================
+
+const otpStore = {}; // ✅ Make sure this is globally accessible (above all routes)
+
+// 🔹 Use your Gmail App Password (not your real Gmail password)
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
+     user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS, // ⚠️ Replace with your Gmail App Password
   },
 });
 
-transporter.verify((error, success) => {
-  if (error) console.error('❌ Gmail SMTP Error:', error);
-  else console.log('✅ Gmail SMTP is ready to send emails');
-});
-
-// =============================
-// OTP Store (Temporary Memory)
-// =============================
-let otpStore = {}; // { email: { otp, expires } }
-
+// 🔹 OTP Generator Function
 function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000);
+  return Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
 }
 
 // =============================
-// SEND OTP to Gmail
+// SEND OTP
 // =============================
 app.post('/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
+    if (!email)
+      return res.status(400).json({ success: false, error: 'Email is required' });
 
     const otp = generateOtp();
-    otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 };
+    otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 }; // 5 min expiry
 
     const mailOptions = {
       from: 'muthuram921@gmail.com',
       to: email,
       subject: 'Your OTP Verification Code',
-      html: `<h3>Your OTP is:</h3><h1>${otp}</h1><p>Valid for 5 minutes.</p>`,
+      html: `
+        <div style="font-family:sans-serif;">
+          <h3>Your OTP is:</h3>
+          <h1 style="color:#2E86C1;">${otp}</h1>
+          <p>This OTP is valid for 5 minutes.</p>
+        </div>
+      `,
     };
 
     await transporter.sendMail(mailOptions);
-    res.json({ success: true, message: '✅ OTP sent successfully to your Gmail' });
+
+    console.log(`✅ OTP ${otp} sent to ${email}`);
+    res.json({ success: true, message: 'OTP sent successfully to Gmail' });
   } catch (err) {
-    res.status(500).json({ success: false, error: 'Failed to send OTP' });
+    console.error('❌ Error sending OTP:', err.message);
+    res.status(500).json({ success: false, error: 'Failed to send OTP. Please try again.' });
   }
 });
 
@@ -135,19 +140,28 @@ app.post('/send-otp', async (req, res) => {
 // VERIFY OTP
 // =============================
 app.post('/verify-otp', (req, res) => {
-  const { email, otp } = req.body;
-  if (!email || !otp)
-    return res.status(400).json({ success: false, error: 'Email and OTP required' });
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp)
+      return res.status(400).json({ success: false, error: 'Email and OTP required' });
 
-  const record = otpStore[email];
-  if (!record) return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
-  if (Date.now() > record.expires) return res.status(400).json({ success: false, error: 'OTP expired' });
+    const record = otpStore[email];
+    if (!record)
+      return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
 
-  if (String(record.otp) !== String(otp))
-    return res.status(400).json({ success: false, error: 'Invalid OTP' });
+    if (Date.now() > record.expires)
+      return res.status(400).json({ success: false, error: 'OTP expired' });
 
-  delete otpStore[email];
-  res.json({ success: true, message: '✅ OTP verified successfully' });
+    if (String(record.otp) !== String(otp))
+      return res.status(400).json({ success: false, error: 'Invalid OTP' });
+
+    delete otpStore[email];
+    console.log(`✅ OTP verified for ${email}`);
+    res.json({ success: true, message: 'OTP verified successfully' });
+  } catch (err) {
+    console.error('❌ OTP Verification Error:', err.message);
+    res.status(500).json({ success: false, error: 'Server error during OTP verification' });
+  }
 });
 
 // =============================
