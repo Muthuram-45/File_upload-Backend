@@ -99,8 +99,8 @@ const otpStore = {}; // ✅ Make sure this is globally accessible (above all rou
 // 🔹 Use your Gmail App Password (not your real Gmail password)
 const transporter = nodemailer.createTransport({
   host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
+  port: 587,
+  secure: false, // must be false for port 587
   auth: {
     user: process.env.MAIL_USER,
     pass: process.env.MAIL_PASS,
