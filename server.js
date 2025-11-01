@@ -275,15 +275,15 @@ const { google } = require('googleapis');
 // =============================
 app.post('/google-login', async (req, res) => {
   try {
-    const { firebaseToken } = req.body;
-    if (!firebaseToken)
-      return res.status(400).json({ success: false, error: 'Firebase token required' });
+    const { token } = req.body; // ✅ renamed to token (simpler)
+    if (!token)
+      return res.status(400).json({ success: false, error: 'Token required' });
 
     // ✅ Step 1: Verify Firebase token
-    const decoded = await admin.auth().verifyIdToken(firebaseToken);
+    const decoded = await admin.auth().verifyIdToken(token);
     const email = decoded.email;
-    const firstName = decoded.name?.split(' ')[0] || '';
-    const lastName = decoded.name?.split(' ')[1] || '';
+    const fullName = decoded.name || '';
+    const [firstName, lastName = ''] = fullName.split(' ');
     const picture = decoded.picture || '';
 
     console.log(`🧾 Google Sign-In Request Received for: ${email}`);
@@ -308,13 +308,13 @@ app.post('/google-login', async (req, res) => {
     }
 
     // ✅ Step 3: Generate JWT Token
-    const token = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
+    const appToken = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
 
-    // ✅ Step 4: Send confirmation to frontend (Frontend already asks authority confirmation)
+    // ✅ Step 4: Send response
     return res.json({
       success: true,
       message: '✅ Google Sign-In successful',
-      token,
+      token: appToken,
       user: {
         id: user.id,
         firstName: user.first_name,
@@ -328,6 +328,7 @@ app.post('/google-login', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Invalid or expired Firebase token' });
   }
 });
+
 
 // =============================
 // FETCH USER PROFILE (Latest from DB)
