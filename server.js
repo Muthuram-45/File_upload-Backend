@@ -8,13 +8,13 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-// const dotenv = require('dotenv');
+const dotenv = require('dotenv');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 
-// dotenv.config();
+dotenv.config();
 
 
 const admin = require('firebase-admin');
@@ -99,20 +99,19 @@ app.use('/uploads', express.static(uploadDir));
 // =============================
 // Nodemailer Setup
 // =============================
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.MAIL_PASS,
-    pass: process.env.MAIL_PASS,
-  },
-});
+// ✅ Brevo transporter
+const transporter = nodemailer.createTransport(
+  new SibTransport({
+    apiKey: process.env.BREVO_API_KEY,
+  })
+);
 
+// ✅ Verify Brevo connection
 transporter.verify((error, success) => {
-  if (error) console.error('❌ Gmail SMTP Error:', error);
-  else console.log('✅ Gmail SMTP is ready to send emails');
+  if (error) console.error("❌ Brevo SMTP Connection Error:", error);
+  else console.log("✅ Brevo SMTP Connected Successfully");
 });
 
-require("dotenv").config();
 
 // =============================
 // OTP Store (Temporary Memory)
