@@ -8,7 +8,6 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const SibTransport = require('nodemailer-sendinblue-transport');
 const dotenv = require('dotenv');
 
 const app = express();
@@ -97,22 +96,22 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 app.use('/uploads', express.static(uploadDir));
 
+const upload = multer({ storage });
 // =============================
 // Nodemailer Setup
 // =============================
-// ✅ Brevo transporter
-const transporter = nodemailer.createTransport(
-  new SibTransport({
-    apiKey: process.env.BREVO_API_KEY,
-  })
-);
-
-// ✅ Verify Brevo connection
-transporter.verify((error, success) => {
-  if (error) console.error("❌ Brevo SMTP Connection Error:", error);
-  else console.log("✅ Brevo SMTP Connected Successfully");
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_USER,
+  },
 });
 
+transporter.verify((error, success) => {
+  if (error) console.error('❌ Gmail SMTP Error:', error);
+  else console.log('✅ Gmail SMTP is ready to send emails');
+});
 
 // =============================
 // OTP Store (Temporary Memory)
@@ -124,28 +123,27 @@ function generateOtp() {
 }
 
 // =============================
-// SEND OTP to Gmail (via Brevo)
+// SEND OTP to Gmail
 // =============================
-app.post("/send-otp", async (req, res) => {
+app.post('/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, error: "Email is required" });
+    if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
 
-    const otp = Math.floor(100000 + Math.random() * 900000);
+    const otp = generateOtp();
     otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 };
 
     const mailOptions = {
-      from: "muthuram921@gmail.com", // must be verified in Brevo
+      from: 'muthuram921@gmail.com',
       to: email,
-      subject: "Your OTP Verification Code",
+      subject: 'Your OTP Verification Code',
       html: `<h3>Your OTP is:</h3><h1>${otp}</h1><p>Valid for 5 minutes.</p>`,
     };
 
     await transporter.sendMail(mailOptions);
-    res.json({ success: true, message: "✅ OTP sent successfully" });
+    res.json({ success: true, message: '✅ OTP sent successfully to your Gmail' });
   } catch (err) {
-    console.error("❌ Send OTP Error:", err);
-    res.status(500).json({ success: false, error: "Failed to send OTP" });
+    res.status(500).json({ success: false, error: 'Failed to send OTP' });
   }
 });
 
@@ -158,11 +156,8 @@ app.post('/verify-otp', (req, res) => {
     return res.status(400).json({ success: false, error: 'Email and OTP required' });
 
   const record = otpStore[email];
-  if (!record)
-    return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
-
-  if (Date.now() > record.expires)
-    return res.status(400).json({ success: false, error: 'OTP expired' });
+  if (!record) return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+  if (Date.now() > record.expires) return res.status(400).json({ success: false, error: 'OTP expired' });
 
   if (String(record.otp) !== String(otp))
     return res.status(400).json({ success: false, error: 'Invalid OTP' });
@@ -170,7 +165,6 @@ app.post('/verify-otp', (req, res) => {
   delete otpStore[email];
   res.json({ success: true, message: '✅ OTP verified successfully' });
 });
-
 // =============================
 // REGISTER USER
 // =============================
