@@ -124,26 +124,40 @@ function generateOtp() {
 }
 
 // =============================
-// SEND OTP to Gmail
+// SEND OTP to Gmail (via Brevo)
 // =============================
 app.post('/send-otp', async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
+    if (!email)
+      return res.status(400).json({ success: false, error: 'Email is required' });
 
     const otp = generateOtp();
     otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 };
 
     const mailOptions = {
-      from: 'muthuram921@gmail.com',
+      from: {
+        name: 'MuthuRam App',
+        address: 'no-reply@muthuramapp.com', // You can customize this
+      },
       to: email,
       subject: 'Your OTP Verification Code',
-      html: `<h3>Your OTP is:</h3><h1>${otp}</h1><p>Valid for 5 minutes.</p>`,
+      html: `
+        <div style="font-family:Arial, sans-serif; color:#333">
+          <h2>🔐 OTP Verification</h2>
+          <p>Your OTP code is:</p>
+          <h1 style="color:#2E86C1">${otp}</h1>
+          <p>This code is valid for <b>5 minutes</b>.</p>
+          <p>If you did not request this, please ignore this email.</p>
+        </div>
+      `,
     };
 
     await transporter.sendMail(mailOptions);
+    console.log(`✅ OTP ${otp} sent to ${email}`);
     res.json({ success: true, message: '✅ OTP sent successfully to your Gmail' });
   } catch (err) {
+    console.error('❌ Send OTP Error:', err);
     res.status(500).json({ success: false, error: 'Failed to send OTP' });
   }
 });
@@ -157,8 +171,11 @@ app.post('/verify-otp', (req, res) => {
     return res.status(400).json({ success: false, error: 'Email and OTP required' });
 
   const record = otpStore[email];
-  if (!record) return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
-  if (Date.now() > record.expires) return res.status(400).json({ success: false, error: 'OTP expired' });
+  if (!record)
+    return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+
+  if (Date.now() > record.expires)
+    return res.status(400).json({ success: false, error: 'OTP expired' });
 
   if (String(record.otp) !== String(otp))
     return res.status(400).json({ success: false, error: 'Invalid OTP' });
