@@ -8,13 +8,13 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const dotenv = require('dotenv');
+// const dotenv = require('dotenv');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
 
-dotenv.config();
+// dotenv.config();
 
 
 const admin = require('firebase-admin');
@@ -111,6 +111,8 @@ transporter.verify((error, success) => {
   if (error) console.error('❌ Gmail SMTP Error:', error);
   else console.log('✅ Gmail SMTP is ready to send emails');
 });
+
+require("dotenv").config();
 
 // =============================
 // OTP Store (Temporary Memory)
