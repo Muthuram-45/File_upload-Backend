@@ -8,7 +8,7 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-import SibTransport from "nodemailer-sendinblue-transport";
+const SibTransport = require('nodemailer-sendinblue-transport');
 const dotenv = require('dotenv');
 
 const app = express();
