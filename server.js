@@ -41,9 +41,15 @@ admin.initializeApp({
 // =============================
 // Middleware
 // =============================
-app.use(express.json());
-app.use(cors());
+// ✅ Allow specific frontend domain (Netlify)
+app.use(cors({
+  origin: ['https://admirable-tanuki-d61676.netlify.app'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
+// ✅ Parse JSON
+app.use(express.json());
 // =============================
 // MySQL Connection
 // =============================
