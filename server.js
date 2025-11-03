@@ -186,33 +186,32 @@ app.post('/register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
-// =============================
-// REGISTER USER
-// =============================
-app.post('/register', async (req, res) => {
+
+app.post('/company-register', async (req, res) => {
   try {
     const { firstName, lastName, email, mobile, password, company_name } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ success: false, error: 'Email and password required' });
+    if (!email || !password || !company_name)
+      return res.status(400).json({ success: false, error: 'All fields required' });
 
     const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
     if (existing.length > 0)
-      return res.status(400).json({ success: false, error: 'User already registered' });
+      return res.status(400).json({ success: false, error: 'Company already registered' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
     await db
       .promise()
       .query(
         'INSERT INTO users (first_name, last_name, email, mobile, password, company_name) VALUES (?, ?, ?, ?, ?, ?)',
-        [firstName, lastName, email, mobile || '', hashedPassword, company_name || null]
+        [firstName, lastName, email, mobile || '', hashedPassword, company_name]
       );
 
-    res.json({ success: true, message: '✅ User registered successfully' });
+    res.json({ success: true, message: '✅ Company registered successfully' });
   } catch (err) {
-    console.error('❌ Register Error:', err);
+    console.error('❌ Company Register Error:', err);
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
+
 
 // =============================
 // NORMAL LOGIN (NO COMPANY)
