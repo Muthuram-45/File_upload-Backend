@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
@@ -8,30 +7,17 @@ const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const dotenv = require('dotenv');
 
 const app = express();
-const port = process.env.PORT || 5000;
+const port = 5000;
 
+require('dotenv').config();
 
-dotenv.config();
-
+// ✅ JWT Secret Key
+const secretKey = 'f8a0c1b6d2e9-42ad-9a3f-57b4a0c9e2f'; // 🔥 Add this line
 
 const admin = require('firebase-admin');
-
-
-let serviceAccount;
-
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  } catch (err) {
-    console.error("🔥 Invalid FIREBASE_SERVICE_ACCOUNT JSON:", err);
-  }
-} else {
-  serviceAccount = require('./firebase-service-account.json');
-}
-
+const serviceAccount = require('./firebase-service-account.json');
 
 // ✅ Initialize Firebase Admin
 admin.initializeApp({
@@ -44,135 +30,155 @@ admin.initializeApp({
 app.use(express.json());
 app.use(cors());
 
-// =============================
-// MySQL Connection
-// =============================
-const db = mysql.createPool({
-    host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  //port: process.env.DB_PORT,
-  port: 3306,
-  waitForConnections:true,
-  connectionLimit:10,
-  queueLimit: 0,
-  ssl:{
-    rejectUnauthorized:false
-  }
-});
-module.exports = db;
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads/processed', express.static(path.join(__dirname, 'uploads/processed')));
 
-db.query('SELECT 1', (err) => {
+// =============================
+// DATABASE CONNECTION
+// =============================
+const db = mysql.createConnection({
+  host: 'localhost',
+  user: 'root',
+  password: '8080',
+  database: 'file_upload_db',
+});
+
+db.connect((err) => {
   if (err) {
     console.error('❌ MySQL connection failed:', err);
     process.exit(1);
   }
-  console.log('✅ MySQL pool connected successfully');
+  console.log('✅ Connected to MySQL Database');
 });
 
-app.get("/", (req, res) => {
-  res.send("✅ Backend is live!");
-});
-
-
 // =============================
-// Multer (for File Upload)
+// MULTER SETUP
 // =============================
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) =>
-    cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '_')),
+  destination: (req, file, cb) => {
+    cb(null, 'uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  },
 });
 const upload = multer({ storage });
-app.use('/uploads', express.static(uploadDir));
 
-// =============================
-// EMAIL (OTP) SETUP
-// =============================
-
-const otpStore = {}; // ✅ Make sure this is globally accessible (above all routes)
-
-// 🔹 Use your Gmail App Password (not your real Gmail password)
 const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false, // must be false for port 587
+  host: 'smtp.gmail.com',
+  port: 465,
+  secure: true, // use SSL
   auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  }
+    user: 'muthuram921@gmail.com',
+    pass: 'clkz ubzz dyjq jwdt', // your app password
+  },
 });
 
-// 🔹 OTP Generator Function
+
+transporter.verify((error, success) => {
+  if (error) console.error('❌ Gmail SMTP Error:', error);
+  else console.log('✅ Gmail SMTP is ready to send emails');
+});
+// =============================
+// OTP Store (Temporary Memory)
+// =============================
+let otpStore = {}; // { email: { otp, expires } }
+
+// Clean expired OTPs every 1 minute
+setInterval(() => {
+  const now = Date.now();
+  for (const email in otpStore) {
+    if (otpStore[email].expires < now) {
+      delete otpStore[email];
+    }
+  }
+}, 60 * 1000);
+
+// =============================
+// Helper Function: Generate OTP
+// =============================
 function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
 }
-
 // =============================
-// SEND OTP
+// SEND OTP Endpoint
 // =============================
-app.post('/send-otp', async (req, res) => {
+app.post("/send-otp", async (req, res) => {
   try {
     const { email } = req.body;
-    if (!email)
-      return res.status(400).json({ success: false, error: 'Email is required' });
 
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Email is required" });
+    }
+
+    // Generate a new OTP
     const otp = generateOtp();
-    otpStore[email] = { otp, expires: Date.now() + 5 * 60 * 1000 }; // 5 min expiry
+    otpStore[email] = {
+      otp,
+      expires: Date.now() + 10 * 60 * 1000, // 10 min expiry
+    };
 
+    console.log(`📩 Generated OTP ${otp} for ${email}`);
+
+    // Mail content
     const mailOptions = {
-      from: process.env.MAIL_USER,
+      from: '"Muthu Ram - Verification" <muthuram921@gmail.com>',
       to: email,
-      subject: 'Your OTP Verification Code',
+      subject: "Your OTP Verification Code",
       html: `
-        <div style="font-family:sans-serif;">
-          <h3>Your OTP is:</h3>
-          <h1 style="color:#2E86C1;">${otp}</h1>
-          <p>This OTP is valid for 5 minutes.</p>
+        <div style="font-family: Arial, sans-serif; padding: 15px; background: #f9f9f9;">
+          <h2 style="color: #2c3e50;">🔐 Your OTP Code</h2>
+          <p style="font-size: 16px;">Use the OTP below to verify your account:</p>
+          <h1 style="color: #3498db; letter-spacing: 2px;">${otp}</h1>
+          <p>This OTP is valid for <strong>10 minutes</strong>.</p>
+          <p>If you did not request this, please ignore this email.</p>
         </div>
       `,
     };
 
+    // Send the mail
     await transporter.sendMail(mailOptions);
 
-    console.log(`✅ OTP ${otp} sent to ${email}`);
-    res.json({ success: true, message: 'OTP sent successfully to Gmail' });
-  } catch (err) {
-    console.error('❌ Error sending OTP:', err.message);
-    res.status(500).json({ success: false, error: 'Failed to send OTP. Please try again.' });
+    console.log(`✅ OTP email sent successfully to ${email}`);
+    return res.json({
+      success: true,
+      message: "✅ OTP sent successfully to your email",
+    });
+  } catch (error) {
+    console.error("❌ OTP Send Error:", error);
+
+    // Specific error handling
+    if (error.response && error.response.includes("Daily user sending quota exceeded")) {
+      return res.status(429).json({
+        success: false,
+        error: "Email sending limit reached. Try again later.",
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: "Failed to send OTP. Please try again later.",
+    });
   }
 });
-
 // =============================
 // VERIFY OTP
 // =============================
 app.post('/verify-otp', (req, res) => {
-  try {
-    const { email, otp } = req.body;
-    if (!email || !otp)
-      return res.status(400).json({ success: false, error: 'Email and OTP required' });
+  const { email, otp } = req.body;
+  if (!email || !otp)
+    return res.status(400).json({ success: false, error: 'Email and OTP required' });
 
-    const record = otpStore[email];
-    if (!record)
-      return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+  const record = otpStore[email];
+  if (!record) return res.status(400).json({ success: false, error: 'OTP not sent or expired' });
+  if (Date.now() > record.expires) return res.status(400).json({ success: false, error: 'OTP expired' });
 
-    if (Date.now() > record.expires)
-      return res.status(400).json({ success: false, error: 'OTP expired' });
+  if (String(record.otp) !== String(otp))
+    return res.status(400).json({ success: false, error: 'Invalid OTP' });
 
-    if (String(record.otp) !== String(otp))
-      return res.status(400).json({ success: false, error: 'Invalid OTP' });
-
-    delete otpStore[email];
-    console.log(`✅ OTP verified for ${email}`);
-    res.json({ success: true, message: 'OTP verified successfully' });
-  } catch (err) {
-    console.error('❌ OTP Verification Error:', err.message);
-    res.status(500).json({ success: false, error: 'Server error during OTP verification' });
-  }
+  delete otpStore[email];
+  res.json({ success: true, message: '✅ OTP verified successfully' });
 });
 
 // =============================
@@ -202,6 +208,32 @@ app.post('/register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
+
+app.post('/company-register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, mobile, password, company_name } = req.body;
+    if (!email || !password || !company_name)
+      return res.status(400).json({ success: false, error: 'All fields required' });
+
+    const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+    if (existing.length > 0)
+      return res.status(400).json({ success: false, error: 'Company already registered' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await db
+      .promise()
+      .query(
+        'INSERT INTO users (first_name, last_name, email, mobile, password, company_name) VALUES (?, ?, ?, ?, ?, ?)',
+        [firstName, lastName, email, mobile || '', hashedPassword, company_name]
+      );
+
+    res.json({ success: true, message: '✅ Company registered successfully' });
+  } catch (err) {
+    console.error('❌ Company Register Error:', err);
+    res.status(500).json({ success: false, error: 'Internal Server Error' });
+  }
+});
+
 
 // =============================
 // NORMAL LOGIN (NO COMPANY)
@@ -354,19 +386,28 @@ app.post('/google-login', async (req, res) => {
   }
 });
 
-
 // =============================
 // FETCH USER PROFILE (Latest from DB)
 // =============================
 app.get('/user/:email', async (req, res) => {
   try {
     const { email } = req.params;
-    if (!email) return res.status(400).json({ success: false, error: 'Email required' });
+    if (!email)
+      return res.status(400).json({ success: false, error: 'Email required' });
 
-    const [rows] = await db.promise().query(
-      'SELECT first_name AS firstName, last_name AS lastName, email, mobile FROM users WHERE email = ?',
-      [email]
-    );
+    const [rows] = await db
+      .promise()
+      .query(
+        `SELECT 
+          first_name AS firstName, 
+          last_name AS lastName, 
+          email, 
+          mobile, 
+          company_name AS company_name
+        FROM users 
+        WHERE email = ?`,
+        [email]
+      );
 
     if (rows.length === 0)
       return res.status(404).json({ success: false, error: 'User not found' });
@@ -377,6 +418,7 @@ app.get('/user/:email', async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
 
 
 // =============================
@@ -392,9 +434,7 @@ function authenticateToken(req, res, next) {
     req.user = user;
     next();
   });
-}
-
-// =============================
+}// =============================
 // FILE UPLOAD (Company + Normal Users)
 // =============================
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
@@ -430,44 +470,99 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 });
 
 // =============================
-// GET FILES (Company + Public Files)
+// GET FILES (Uploaded + Processed from DB)
 // =============================
 app.get('/files', authenticateToken, async (req, res) => {
   try {
     const company = req.user.company_name || null;
-    let query, values;
 
+    // ---- Uploaded files from DB ----
+    let uploadedQuery, values;
     if (company) {
-      // ✅ Company user sees both their files and public files
-      query = `
-        SELECT file_name AS name, file_path AS path 
-        FROM files 
-        WHERE company_name = ? OR company_name IS NULL 
+      uploadedQuery = `
+        SELECT id, file_name AS name, file_path AS path, 'uploaded' AS type
+        FROM files
+        WHERE company_name = ? OR company_name IS NULL
         ORDER BY id DESC
       `;
       values = [company];
     } else {
-      // ✅ Normal user → only public files
-      query = `
-        SELECT file_name AS name, file_path AS path 
-        FROM files 
-        WHERE company_name IS NULL 
+      uploadedQuery = `
+        SELECT id, file_name AS name, file_path AS path, 'uploaded' AS type
+        FROM files
+        WHERE company_name IS NULL
         ORDER BY id DESC
       `;
       values = [];
     }
+    const [uploadedFiles] = await db.promise().query(uploadedQuery, values);
 
-    const [files] = await db.promise().query(query, values);
-    res.json(files);
+    // ---- Processed folders from DB ----
+    const [folders] = await db.promise().query(
+      'SELECT id, folder_name, folder_path, tables_json FROM processed_files ORDER BY id DESC'
+    );
+
+    const processedFolders = folders.map(f => {
+      let tables = {};
+      try {
+        tables = f.tables_json ? JSON.parse(f.tables_json) : {};
+      } catch (e) {
+        console.error('❌ Error parsing tables_json for folder', f.folder_name, e);
+      }
+
+      return {
+        id: f.id,
+        folderName: f.folder_name,       // folder name = raw uploaded file name
+        folderPath: f.folder_path,
+        tables,
+        csvCount: Object.keys(tables).length,
+        type: 'processed',
+      };
+    });
+
+    res.json({ uploadedFiles, processedFolders });
   } catch (err) {
     console.error('❌ Fetch Files Error:', err);
     res.status(500).json({ success: false, error: 'Error fetching files' });
   }
 });
 
+// =============================
+// GET CSV files inside a processed folder by folder ID
+// =============================
+app.get('/processed-folder/:id', authenticateToken, async (req, res) => {
+  try {
+    const folderId = req.params.id;
+
+    const [folders] = await db.promise().query(
+      'SELECT * FROM processed_files WHERE id = ?',
+      [folderId]
+    );
+
+    if (!folders.length) return res.status(404).json({ error: 'Folder not found' });
+
+    const folder = folders[0];
+    const folderPath = folder.folder_path;
+
+    if (!fs.existsSync(folderPath)) return res.status(404).json({ error: 'Folder path does not exist' });
+
+    const files = fs.readdirSync(folderPath)
+      .filter(f => f.endsWith('.csv'))
+      .map(f => ({
+        name: f,
+        path: `/uploads/processed/${path.basename(folderPath)}/${f}` // Adjust URL path if needed
+      }));
+
+    res.json({ folder: { id: folder.id, folderName: folder.folder_name, files } });
+
+  } catch (err) {
+    console.error('❌ Fetch Processed Folder Error:', err);
+    res.status(500).json({ success: false, error: 'Error fetching processed folder' });
+  }
+});
 
 
-/// =============================
+// =============================
 // UPDATE USER PROFILE (Supports Password)
 // =============================
 app.put('/update-profile', async (req, res) => {
@@ -628,4 +723,5 @@ app.put('/change-mobile', async (req, res) => {
 // =============================
 // START SERVER
 // =============================
-app.listen(port, () => console.log(`🚀 Server running on port ${port}`));
+
+app.listen(port, () => console.log(`🚀 Server running on http://localhost:${port}`));
