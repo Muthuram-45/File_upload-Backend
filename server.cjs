@@ -22,7 +22,7 @@ const client = new OpenAI({
 });
 
 // ✅ JWT Secret Key
-const secretKey = 'f8a0c1b6d2e9-42ad-9a3f-57b4a0c9e2f'; // 🔥 Add this line
+const secret_key = 'f8a0c1b6d2e9-42ad-9a3f-57b4a0c9e2f'; // 🔥 Add this line
 
 const admin = require('firebase-admin');
 const serviceAccount = require('./firebase-service-account.json');
@@ -241,8 +241,6 @@ app.post('/company-register', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
-
-
 // =============================
 // NORMAL LOGIN (NO COMPANY)
 // =============================
@@ -261,6 +259,11 @@ app.post('/login', async (req, res) => {
     if (!isMatch)
       return res.status(400).json({ success: false, error: 'Invalid credentials' });
 
+    const now = new Date();
+
+    // ✅ UPDATE LAST LOGIN
+    await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
+
     const token = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
 
     res.json({
@@ -273,6 +276,7 @@ app.post('/login', async (req, res) => {
         lastName: user.last_name,
         email: user.email,
         mobile: user.mobile,
+        lastLogin: now,
       },
     });
   } catch (err) {
@@ -281,13 +285,15 @@ app.post('/login', async (req, res) => {
   }
 });
 
+// =============================
+// COMPANY LOGIN
+// =============================
 app.post('/company-login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ success: false, error: 'Email and password required' });
 
-    // ✅ Fetch mobile also
     const [rows] = await db
       .promise()
       .query(
@@ -303,19 +309,17 @@ app.post('/company-login', async (req, res) => {
     if (!isMatch)
       return res.status(400).json({ success: false, error: 'Invalid password' });
 
-    // ✅ Include mobile in token too
+    const now = new Date();
+
+    // ✅ UPDATE LAST LOGIN
+    await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
+
     const token = jwt.sign(
-      {
-        id: user.id,
-        email: user.email,
-        company_name: user.company_name,
-        mobile: user.mobile,
-      },
+      { id: user.id, email: user.email, company_name: user.company_name, mobile: user.mobile },
       'secret_key',
       { expiresIn: '1h' }
     );
 
-    // ✅ Return all necessary fields, including mobile
     res.json({
       success: true,
       message: '✅ Company login successful',
@@ -327,6 +331,7 @@ app.post('/company-login', async (req, res) => {
         email: user.email,
         company_name: user.company_name,
         mobile: user.mobile,
+        lastLogin: now,
       },
     });
   } catch (err) {
@@ -334,17 +339,16 @@ app.post('/company-login', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
-const { google } = require('googleapis');
 
-// ✅ GOOGLE LOGIN (Updated with Authority Logging)
+// =============================
+// GOOGLE LOGIN
 // =============================
 app.post('/google-login', async (req, res) => {
   try {
-    const { token } = req.body; // ✅ renamed to token (simpler)
+    const { token } = req.body;
     if (!token)
       return res.status(400).json({ success: false, error: 'Token required' });
 
-    // ✅ Step 1: Verify Firebase token
     const decoded = await admin.auth().verifyIdToken(token);
     const email = decoded.email;
     const fullName = decoded.name || '';
@@ -353,7 +357,6 @@ app.post('/google-login', async (req, res) => {
 
     console.log(`🧾 Google Sign-In Request Received for: ${email}`);
 
-    // ✅ Step 2: Check if the user exists in MySQL
     const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
 
     let user;
@@ -362,21 +365,21 @@ app.post('/google-login', async (req, res) => {
       await db
         .promise()
         .query(
-          'INSERT INTO users (first_name, last_name, email, mobile, password) VALUES (?, ?, ?, ?, ?)',
-          [firstName, lastName, email, '', '']
+          'INSERT INTO users (first_name, last_name, email, mobile, password, last_login) VALUES (?, ?, ?, ?, ?, ?)',
+          [firstName, lastName, email, '', '', new Date()]
         );
       const [newUser] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
       user = newUser[0];
     } else {
       user = existing[0];
       console.log(`✅ Existing Google user found: ${email}`);
+      // ✅ UPDATE LAST LOGIN
+      await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [new Date(), user.id]);
     }
 
-    // ✅ Step 3: Generate JWT Token
     const appToken = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
 
-    // ✅ Step 4: Send response
-    return res.json({
+    res.json({
       success: true,
       message: '✅ Google Sign-In successful',
       token: appToken,
@@ -386,11 +389,12 @@ app.post('/google-login', async (req, res) => {
         lastName: user.last_name,
         email: user.email,
         picture,
+        lastLogin: new Date(),
       },
     });
   } catch (err) {
     console.error('❌ Google Login Error:', err);
-    return res.status(400).json({ success: false, error: 'Invalid or expired Firebase token' });
+    res.status(400).json({ success: false, error: 'Invalid or expired Firebase token' });
   }
 });
 
@@ -411,7 +415,8 @@ app.get('/user/:email', async (req, res) => {
           last_name AS lastName, 
           email, 
           mobile, 
-          company_name AS company_name
+          company_name AS company_name,
+          last_login AS lastLogin
         FROM users 
         WHERE email = ?`,
         [email]
@@ -426,8 +431,6 @@ app.get('/user/:email', async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-
-
 
 // =============================
 // AUTH MIDDLEWARE
