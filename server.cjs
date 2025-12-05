@@ -6,15 +6,19 @@ const jwt = require('jsonwebtoken');
 const mysql = require('mysql2');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-const OpenAI = require("openai"); 
+// const fs = require('fs');
+const csv = require('csv-parser');
+const { Parser } = require('json2csv');
+const fs = require('fs-extra');
+// const path = require('path');
+const OpenAI = require("openai");
 
 const app = express();
 const port = 5000;
 
 require('dotenv').config();
 
-   // CommonJS require
+// CommonJS require
 
 // Initialize the OpenAI client
 const client = new OpenAI({
@@ -38,8 +42,16 @@ admin.initializeApp({
 app.use(express.json());
 app.use(cors());
 
+app.use(cors({
+  origin: "http://localhost:5173", // or 3000
+  methods: ["GET", "POST", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/uploads/processed', express.static(path.join(__dirname, 'uploads/processed')));
+
 
 // =============================
 // DATABASE CONNECTION
@@ -71,7 +83,9 @@ const storage = multer.diskStorage({
     cb(null, uniqueSuffix + path.extname(file.originalname));
   },
 });
+
 const upload = multer({ storage });
+
 
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
@@ -264,7 +278,7 @@ app.post('/login', async (req, res) => {
     // ✅ UPDATE LAST LOGIN
     await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
 
-    const token = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
+    const token = jwt.sign({ id: user.id, email: user.email }, secret_key, { expiresIn: '24h' });
 
     res.json({
       success: true,
@@ -316,9 +330,10 @@ app.post('/company-login', async (req, res) => {
 
     const token = jwt.sign(
       { id: user.id, email: user.email, company_name: user.company_name, mobile: user.mobile },
-      'secret_key',
-      { expiresIn: '1h' }
+      secret_key,
+      { expiresIn: '24h' }
     );
+
 
     res.json({
       success: true,
@@ -377,7 +392,8 @@ app.post('/google-login', async (req, res) => {
       await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [new Date(), user.id]);
     }
 
-    const appToken = jwt.sign({ id: user.id, email: user.email }, 'secret_key', { expiresIn: '1h' });
+    const appToken = jwt.sign({ id: user.id, email: user.email }, secret_key, { expiresIn: '24h' });
+
 
     res.json({
       success: true,
@@ -436,50 +452,241 @@ app.get('/user/:email', async (req, res) => {
 // AUTH MIDDLEWARE
 // =============================
 function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.sendStatus(401);
+  try {
+    const authHeader = req.headers.authorization;
 
-  jwt.verify(token, 'secret_key', (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
+    console.log("Auth Header received:", authHeader);
+
+    if (!authHeader) {
+      return res.status(403).json({ error: "Authorization header missing" });
+    }
+
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(403).json({ error: "Invalid token format" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    jwt.verify(token, secret_key, (err, user) => {
+      if (err) {
+        console.log("JWT verify error:", err.message);
+
+        if (err.name === "TokenExpiredError") {
+          return res.status(403).json({ error: "Token expired. Please login again." });
+        }
+
+        return res.status(403).json({ error: "Invalid token" });
+      }
+
+      console.log("✅ User verified:", user);
+
+      req.user = user;   // VERY IMPORTANT
+      next();            // continue to /files route
+    });
+
+  } catch (error) {
+    console.log("Middleware crash:", error.message);
+    return res.status(500).json({ error: "Server middleware error" });
+  }
+}
+
+
+
+const readCSV = (filepath) => {
+  return new Promise((resolve, reject) => {
+    const results = [];
+    let headers = [];
+
+    fs.createReadStream(filepath)
+      .pipe(csv())
+      .on('headers', (h) => {
+        headers = h;
+      })
+      .on('data', (data) => results.push(data))
+      .on('end', () => resolve({ headers, data: results }))
+      .on('error', reject);
   });
-}// =============================
-// FILE UPLOAD (Company + Normal Users)
-// =============================
-app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
+};
+
+app.post('/upload', authenticateToken, upload.array('files'), async (req, res) => {
   try {
     const { name } = req.body;
-    if (!req.file) {
+    const company = req.user.company_name || null;
+
+    if (!req.files || req.files.length === 0) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
     }
 
-    // ✅ Extract company name from logged-in user (token)
-    const company = req.user.company_name || null;
+    let finalFilePath = '';
+    let finalFilename = '';
 
-    // File path
-    const filePath = `/uploads/${req.file.filename}`;
+    // ✅ SINGLE FILE
+    if (req.files.length === 1) {
+      const file = req.files[0];
+      finalFilename = file.filename;
+      finalFilePath = `/uploads/${finalFilename}`;
+    }
 
-    // Save in DB
-    await db
-      .promise()
-      .query(
+    // ✅ MULTIPLE FILES
+    if (req.files.length > 1) {
+
+      let allHeaders = [];
+      let allDataRaw = [];
+
+      for (let file of req.files) {
+        const filePath = path.join(__dirname, 'uploads', file.filename);
+        const { headers, data } = await readCSV(filePath);
+
+        const normalizedHeaders = headers.map(h => h.toLowerCase().trim());
+        allHeaders.push(normalizedHeaders);
+
+        const normalizedData = data.map(row => {
+          const newRow = {};
+          Object.keys(row).forEach(k => {
+            newRow[k.toLowerCase().trim()] = row[k];
+          });
+          return newRow;
+        });
+
+        allDataRaw.push(normalizedData);
+      }
+
+      // ✅ FIND COMMON PRIMARY KEY
+      const commonColumns = allHeaders.reduce((a, b) => a.filter(c => b.includes(c)));
+
+      if (commonColumns.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: '❌ No common primary key column found in all files'
+        });
+      }
+
+      const primaryKey = commonColumns.includes('id')
+        ? 'id'
+        : commonColumns.includes('user_id')
+          ? 'user_id'
+          : commonColumns.includes('emp_id')
+            ? 'emp_id'
+            : commonColumns[0];
+
+      console.log("✅ Using primary key:", primaryKey);
+
+      allHeaders.forEach((headers, index) => {
+        if (!headers.includes(primaryKey)) {
+          throw new Error(`File ${index + 1} does not contain primary key: ${primaryKey}`);
+        }
+      });
+
+      // ✅ ALL COLUMNS (UNION)
+      const allColumnsSet = new Set();
+      allHeaders.forEach(h => h.forEach(c => allColumnsSet.add(c)));
+      let allColumns = Array.from(allColumnsSet);
+
+      const map = new Map();
+      const duplicateTracker = new Set();
+
+      // ✅ SCAN AND DETECT MATCHES
+      for (const fileData of allDataRaw) {
+        for (const row of fileData) {
+
+          if (!row[primaryKey] || row[primaryKey].toString().trim() === "") {
+            console.log("⚠️ Skipping row with missing primary key:", row);
+            continue;
+          }
+
+          const key = row[primaryKey].toString().trim();
+
+          if (!map.has(key)) {
+            const newObj = {};
+            allColumns.forEach(col => (newObj[col] = ""));
+            map.set(key, newObj);
+          } else {
+            duplicateTracker.add(key);
+          }
+
+          const target = map.get(key);
+
+          Object.keys(row).forEach(col => {
+            if (row[col] !== undefined && row[col] !== "") {
+              target[col] = row[col];
+            }
+          });
+        }
+      }
+
+      // ✅ MOVE PRIMARY KEY TO FIRST COLUMN
+      const idx = allColumns.indexOf(primaryKey);
+      if (idx > 0) {
+        allColumns.splice(idx, 1);
+        allColumns.unshift(primaryKey);
+      }
+
+      let finalData = [];
+      let mergeType = "MERGED (JOIN)";
+
+      // ✅ IF NO MATCH → UNION
+      if (duplicateTracker.size === 0) {
+        console.log("⚠ No matching IDs found. Using UNION merge...");
+        finalData = Array.from(map.values());
+        mergeType = "UNION (APPENDED)";
+      } else {
+        console.log("✅ Matching IDs found. Using MERGE logic...");
+        finalData = Array.from(map.values());
+      }
+
+      const parser = new Parser({ fields: allColumns });
+      const mergedCSV = parser.parse(finalData);
+
+      finalFilename = `${mergeType.includes("UNION") ? 'union' : 'merged'}_${Date.now()}.csv`;
+      const mergedFilePath = path.join(__dirname, 'uploads', finalFilename);
+
+      fs.writeFileSync(mergedFilePath, mergedCSV);
+      finalFilePath = `/uploads/${finalFilename}`;
+
+      // ✅ DELETE ORIGINAL FILES
+      req.files.forEach(file => {
+        const oldPath = path.join(__dirname, 'uploads', file.filename);
+        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      });
+
+      // ✅ SAVE FILE INFO TO DATABASE
+      await db.promise().query(
         'INSERT INTO files (file_name, file_path, company_name) VALUES (?, ?, ?)',
-        [name || req.file.originalname, filePath, company]
+        [name, finalFilePath, company]
       );
+
+      return res.json({
+        success: true,
+        message: `✅ File(s) processed successfully using ${mergeType} logic`,
+        file: {
+          file_name: name,
+          file_path: finalFilePath,
+          company_name: company
+        }
+      });
+    }
+
+    // ✅ FOR SINGLE FILE SAVE
+    await db.promise().query(
+      'INSERT INTO files (file_name, file_path, company_name) VALUES (?, ?, ?)',
+      [name, finalFilePath, company]
+    );
 
     res.json({
       success: true,
-      message: '✅ File uploaded successfully',
-      file: { name, path: filePath, company },
+      message: '✅ File uploaded successfully (single file)',
+      file: {
+        file_name: name,
+        file_path: finalFilePath,
+        company_name: company
+      }
     });
+
   } catch (err) {
-    console.error('❌ Upload Error:', err);
-    res.status(500).json({ success: false, error: 'File upload failed' });
+    console.error('❌ Upload Error:', err.message);
+    res.status(500).json({ success: false, error: err.message || 'File upload failed' });
   }
 });
-
 // =============================
 // GET FILES (Uploaded + Processed from DB)
 // =============================
@@ -491,7 +698,7 @@ app.get('/files', authenticateToken, async (req, res) => {
     let uploadedQuery, values;
     if (company) {
       uploadedQuery = `
-        SELECT id, file_name AS name, file_path AS path, 'uploaded' AS type
+        SELECT id, file_name AS name, file_path AS path
         FROM files
         WHERE company_name = ? OR company_name IS NULL
         ORDER BY id DESC
@@ -499,13 +706,14 @@ app.get('/files', authenticateToken, async (req, res) => {
       values = [company];
     } else {
       uploadedQuery = `
-        SELECT id, file_name AS name, file_path AS path, 'uploaded' AS type
+        SELECT id, file_name AS name, file_path AS path
         FROM files
         WHERE company_name IS NULL
         ORDER BY id DESC
       `;
       values = [];
     }
+
     const [uploadedFiles] = await db.promise().query(uploadedQuery, values);
 
     // ---- Processed folders from DB ----
@@ -513,6 +721,60 @@ app.get('/files', authenticateToken, async (req, res) => {
       'SELECT id, folder_name, folder_path, tables_json FROM processed_files ORDER BY id DESC'
     );
 
+    // ✅ Create SET of processed folder names
+    const processedSet = new Set(
+      folders.map(f => f.folder_name.trim().toLowerCase())
+    );
+
+    // ✅ Build map of ALL duplicate indexes
+    const duplicateMap = {};
+
+    uploadedFiles.forEach((file, index) => {
+      const name = file.name.trim().toLowerCase();
+
+      if (!duplicateMap[name]) {
+        duplicateMap[name] = [];
+      }
+
+      duplicateMap[name].push(index); // store all positions
+    });
+
+    // ✅ Add proper STATUS (DONE | PROCESSING | CANCEL)
+    const uploadedFilesWithStatus = uploadedFiles.map((file, index) => {
+      const name = file.name.trim().toLowerCase();
+      const indexes = duplicateMap[name];     // all duplicate positions
+      const isProcessed = processedSet.has(name);
+
+      let status = "PROCESSING";
+
+      // ✅ If PROCESSED → Only ONE DONE, rest CANCEL
+      if (isProcessed) {
+        if (index === indexes[0]) {
+          status = "DONE";     // Only the last uploaded file
+        } else {
+          status = "CANCEL";
+        }
+      }
+
+      // ❌ If NOT PROCESSED → Only LAST ONE PROCESSING, rest CANCEL
+      else {
+        const lastIndex = indexes[0];  // newest one (DESC order)
+
+        if (index === lastIndex) {
+          status = "PROCESSING";
+        } else {
+          status = "CANCEL";
+        }
+      }
+
+      return {
+        ...file,
+        type: 'uploaded',
+        status
+      };
+    });
+
+    // ---- Prepare processed folders ----
     const processedFolders = folders.map(f => {
       let tables = {};
       try {
@@ -523,20 +785,26 @@ app.get('/files', authenticateToken, async (req, res) => {
 
       return {
         id: f.id,
-        folderName: f.folder_name,       // folder name = raw uploaded file name
+        folderName: f.folder_name,
         folderPath: f.folder_path,
         tables,
         csvCount: Object.keys(tables).length,
-        type: 'processed',
+        type: 'processed'
       };
     });
 
-    res.json({ uploadedFiles, processedFolders });
+    res.json({
+      uploadedFiles: uploadedFilesWithStatus,
+      processedFolders
+    });
+
   } catch (err) {
     console.error('❌ Fetch Files Error:', err);
     res.status(500).json({ success: false, error: 'Error fetching files' });
   }
 });
+
+
 
 // =============================
 // GET CSV files inside a processed folder by folder ID
