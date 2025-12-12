@@ -12,6 +12,7 @@ const { Parser } = require('json2csv');
 const fs = require('fs-extra');
 // const path = require('path');
 const OpenAI = require("openai");
+const axios = require('axios');
 
 const app = express();
 const port = 5000;
@@ -39,7 +40,6 @@ admin.initializeApp({
 // =============================
 // Middleware
 // =============================
-app.use(express.json());
 app.use(cors());
 
 app.use(cors({
@@ -48,10 +48,19 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
+app.use(express.json({ limit: '50mb' })); // ✅ allow large JSON payloads
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/uploads/processed', express.static(path.join(__dirname, 'uploads/processed')));
 
+// --------------------------------------------------------
+// 📁 Ensure folder exists: uploads/API_Files
+// --------------------------------------------------------
+const uploadDir = path.join(__dirname, "uploads", "API_Files");
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 // =============================
 // DATABASE CONNECTION
@@ -71,20 +80,31 @@ db.connect((err) => {
   console.log('✅ Connected to MySQL Database');
 });
 
+
 // =============================
-// MULTER SETUP
+// MULTER SETUP  (NO CHANGES REMOVED)
 // =============================
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
+
+    // 🔥 If front-end sends custom file name => use it
+    const customName = req.body.customFileName;
+
+    if (customName) {
+      return cb(null, customName + path.extname(file.originalname));
+    }
+
+    // Otherwise use your default unique file naming
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, uniqueSuffix + path.extname(file.originalname));
   },
 });
 
 const upload = multer({ storage });
+
 
 
 const transporter = nodemailer.createTransport({
@@ -489,6 +509,147 @@ function authenticateToken(req, res, next) {
     return res.status(500).json({ error: "Server middleware error" });
   }
 }
+
+// Fetch API via backend to avoid CORS
+app.get('/fetch-api', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'API URL is required' });
+
+    const response = await axios.get(url);
+    res.json(response.data);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch API' });
+  }
+});
+
+// --------------------------------------------------------
+// 🔍 API to check duplicate file name
+// --------------------------------------------------------
+app.get("/check-filename", (req, res) => {
+  const fileName = req.query.name;
+
+  db.query(
+    "SELECT id FROM api_data WHERE file_name = ?",
+    [fileName],
+    (err, result) => {
+      if (err) return res.json({ exists: false });
+
+      if (result.length > 0) {
+        res.json({ exists: true });
+      } else {
+        res.json({ exists: false });
+      }
+    }
+  );
+});
+
+// --------------------------------------------------------
+// 💾 Utility: Flatten nested objects for CSV
+// --------------------------------------------------------
+const flattenObject = (obj, prefix = '') =>
+  Object.keys(obj).reduce((acc, k) => {
+    const pre = prefix.length ? prefix + '_' : '';
+    if (Array.isArray(obj[k])) {
+      // Arrays are converted to JSON string
+      acc[pre + k] = JSON.stringify(obj[k]);
+    } else if (typeof obj[k] === 'object' && obj[k] !== null) {
+      Object.assign(acc, flattenObject(obj[k], pre + k));
+    } else {
+      acc[pre + k] = obj[k];
+    }
+    return acc;
+  }, {});
+
+// --------------------------------------------------------
+// 💾 Save API data: Dynamic CSV + Save DB
+// --------------------------------------------------------
+app.post("/save-api-data", (req, res) => {
+  const { api_url, file_name, response, company_name } = req.body;
+
+  if (!response) {
+    return res.status(400).json({ success: false, message: "Response is empty" });
+  }
+
+  let jsonData;
+
+  try {
+    jsonData = typeof response === "string" ? JSON.parse(response) : response;
+  } catch (err) {
+    return res.status(400).json({ success: false, message: "Invalid JSON" });
+  }
+
+  // Wrap single objects into array for consistent processing
+  if (!Array.isArray(jsonData)) {
+    jsonData = [jsonData];
+  }
+
+  // Handle nested arrays inside each object (e.g., "products" in carts)
+  const flatData = [];
+  jsonData.forEach(item => {
+    const arrayKeys = Object.keys(item).filter(key => Array.isArray(item[key]));
+
+    if (arrayKeys.length) {
+      // Expand each nested array into multiple rows
+      arrayKeys.forEach(arrKey => {
+        item[arrKey].forEach(subItem => {
+          const row = flattenObject({ ...item, [arrKey]: undefined, ...subItem });
+          flatData.push(row);
+        });
+      });
+    } else {
+      flatData.push(flattenObject(item));
+    }
+  });
+
+  if (flatData.length === 0) {
+    return res.status(400).json({ success: false, message: "No data to save" });
+  }
+
+  // Convert JSON → CSV
+  let csv;
+  try {
+    const fields = Object.keys(flatData[0]);
+    const parser = new Parser({ fields });
+    csv = parser.parse(flatData);
+  } catch (err) {
+    console.error("CSV Parse Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to convert JSON to CSV" });
+  }
+
+  // Save CSV File
+  const filePath = path.join(uploadDir, file_name + ".csv");
+  try {
+    fs.writeFileSync(filePath, csv);
+  } catch (err) {
+    console.error("File Save Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to save CSV file" });
+  }
+
+  // Save in database
+  const sql = `
+    INSERT INTO api_data (api_url, file_name, file_path, response, company_name)
+    VALUES (?, ?, ?, ?, ?)
+  `;
+
+  db.query(
+    sql,
+    [api_url, file_name, `uploads/API_Files/${file_name}.csv`, JSON.stringify(response), company_name],
+    (err, result) => {
+      if (err) {
+        console.error("DB Error:", err);
+        return res.json({ success: false, message: "DB Error" });
+      }
+
+      res.json({
+        success: true,
+        message: "API Data saved successfully!",
+        file_path: `uploads/API_Files/${file_name}.csv`
+      });
+    }
+  );
+});
 
 
 
@@ -978,6 +1139,43 @@ Rules:
     res.status(500).json({ success: false, error: "Server error" });
   }
 });
+
+// =============================
+// ✅ OPENAI CHAT API
+// =============================
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { question } = req.body;
+
+    if (!question) {
+      return res.status(400).json({
+        success: false,
+        error: "Question is required",
+      });
+    }
+
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: question },
+      ],
+    });
+
+    res.json({
+      success: true,
+      answer: response.choices[0].message.content,
+    });
+
+  } catch (error) {
+    console.error("❌ OpenAI Error:", error.message);
+    res.status(500).json({
+      success: false,
+      error: "AI Server Error ❌",
+    });
+  }
+});
+
 
 // =============================
 // UPDATE USER PROFILE (Supports Password)
