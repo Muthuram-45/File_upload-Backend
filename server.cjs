@@ -848,114 +848,112 @@ app.post('/upload', authenticateToken, upload.array('files'), async (req, res) =
     res.status(500).json({ success: false, error: err.message || 'File upload failed' });
   }
 });
+
 // =============================
-// GET FILES (Uploaded + Processed from DB)
+// GET FILES (Uploaded + API + Processed from DB)
 // =============================
 app.get('/files', authenticateToken, async (req, res) => {
   try {
     const company = req.user.company_name || null;
 
-    // ---- Uploaded files from DB ----
-    let uploadedQuery, values;
-    if (company) {
-      uploadedQuery = `
-        SELECT id, file_name AS name, file_path AS path
-        FROM files
-        WHERE company_name = ? OR company_name IS NULL
-        ORDER BY id DESC
-      `;
-      values = [company];
-    } else {
-      uploadedQuery = `
-        SELECT id, file_name AS name, file_path AS path
-        FROM files
-        WHERE company_name IS NULL
-        ORDER BY id DESC
-      `;
-      values = [];
-    }
+    // -----------------------------------
+    // 1️⃣ Fetch Uploaded Files (NO DESC SORT)
+    // -----------------------------------
+    const uploadedQuery = company
+      ? `SELECT id, file_name AS name, file_path AS path FROM files 
+         WHERE company_name = ? OR company_name IS NULL`
+      : `SELECT id, file_name AS name, file_path AS path FROM files 
+         WHERE company_name IS NULL`;
 
-    const [uploadedFiles] = await db.promise().query(uploadedQuery, values);
+    const [uploadedFiles] = await db.promise().query(uploadedQuery, company ? [company] : []);
 
-    // ---- Processed folders from DB ----
-    const [folders] = await db.promise().query(
-      'SELECT id, folder_name, folder_path, tables_json FROM processed_files ORDER BY id DESC'
-    );
+    const uploadedFilesWithSource = uploadedFiles.map(f => ({
+      ...f,
+      source: "Uploaded",
+      type: "uploaded"
+    }));
 
-    // ✅ Create SET of processed folder names
+    // -----------------------------------
+    // 2️⃣ Fetch API Files (NO DESC SORT)
+    // -----------------------------------
+    const [apiFiles] = await db.promise().query(`
+      SELECT id, file_name AS name, file_path AS path 
+      FROM api_data
+    `);
+
+    const apiFilesWithSource = apiFiles.map(f => ({
+      ...f,
+      source: "API",
+      type: "api"
+    }));
+
+    // -----------------------------------
+    // 3️⃣ Merge Files (NO SORTING HERE)
+    // -----------------------------------
+    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource];
+
+    // -----------------------------------
+    // 4️⃣ Fetch Processed Folders (NO DESC SORT)
+    // -----------------------------------
+    const [folders] = await db.promise().query(`
+      SELECT id, folder_name, folder_path, tables_json 
+      FROM processed_files
+    `);
+
     const processedSet = new Set(
       folders.map(f => f.folder_name.trim().toLowerCase())
     );
 
-    // ✅ Build map of ALL duplicate indexes
+    // -----------------------------------
+    // 5️⃣ Duplicate Map
+    // -----------------------------------
     const duplicateMap = {};
-
-    uploadedFiles.forEach((file, index) => {
-      const name = file.name.trim().toLowerCase();
-
-      if (!duplicateMap[name]) {
-        duplicateMap[name] = [];
-      }
-
-      duplicateMap[name].push(index); // store all positions
+    allFiles.forEach((file, index) => {
+      const key = file.name.trim().toLowerCase();
+      if (!duplicateMap[key]) duplicateMap[key] = [];
+      duplicateMap[key].push(index);
     });
 
-    // ✅ Add proper STATUS (DONE | PROCESSING | CANCEL)
-    const uploadedFilesWithStatus = uploadedFiles.map((file, index) => {
+    // -----------------------------------
+    // 6️⃣ Assign Status (NO SORT)
+    // -----------------------------------
+    const finalFiles = allFiles.map((file, index) => {
       const name = file.name.trim().toLowerCase();
-      const indexes = duplicateMap[name];     // all duplicate positions
+      const indexes = duplicateMap[name];
       const isProcessed = processedSet.has(name);
 
-      let status = "PROCESSING";
-
-      // ✅ If PROCESSED → Only ONE DONE, rest CANCEL
-      if (isProcessed) {
-        if (index === indexes[0]) {
-          status = "DONE";     // Only the last uploaded file
-        } else {
-          status = "CANCEL";
-        }
+      if (indexes[0] !== index) {
+        return { ...file, status: "CANCEL" };
       }
 
-      // ❌ If NOT PROCESSED → Only LAST ONE PROCESSING, rest CANCEL
-      else {
-        const lastIndex = indexes[0];  // newest one (DESC order)
-
-        if (index === lastIndex) {
-          status = "PROCESSING";
-        } else {
-          status = "CANCEL";
-        }
-      }
-
-      return {
-        ...file,
-        type: 'uploaded',
-        status
-      };
+      return { ...file, status: isProcessed ? "DONE" : "PROCESSING" };
     });
 
-    // ---- Prepare processed folders ----
+    // -----------------------------------
+    // 7️⃣ Format Processed Folders
+    // -----------------------------------
     const processedFolders = folders.map(f => {
       let tables = {};
       try {
         tables = f.tables_json ? JSON.parse(f.tables_json) : {};
-      } catch (e) {
-        console.error('❌ Error parsing tables_json for folder', f.folder_name, e);
+      } catch (err) {
+        console.error("JSON parse error", f.folder_name);
       }
-
       return {
         id: f.id,
         folderName: f.folder_name,
         folderPath: f.folder_path,
         tables,
         csvCount: Object.keys(tables).length,
-        type: 'processed'
+        type: "processed"
       };
     });
 
+    // -----------------------------------
+    // 8️⃣ Final Response (Frontend Will Sort)
+    // -----------------------------------
     res.json({
-      uploadedFiles: uploadedFilesWithStatus,
+      uploadedFiles: finalFiles,
       processedFolders
     });
 
@@ -964,7 +962,6 @@ app.get('/files', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, error: 'Error fetching files' });
   }
 });
-
 
 
 // =============================
