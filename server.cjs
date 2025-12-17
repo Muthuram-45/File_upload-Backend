@@ -13,6 +13,7 @@ const fs = require('fs-extra');
 // const path = require('path');
 const OpenAI = require("openai");
 const axios = require('axios');
+const readCSV = require("./utils/readCSV.cjs")
 
 const app = express();
 const port = 5000;
@@ -62,6 +63,7 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
+
 // =============================
 // DATABASE CONNECTION
 // =============================
@@ -79,6 +81,7 @@ db.connect((err) => {
   }
   console.log('✅ Connected to MySQL Database');
 });
+
 
 
 // =============================
@@ -651,352 +654,393 @@ app.post("/save-api-data", (req, res) => {
   );
 });
 
+// ======================
+// HELPERS
+// ======================
+const sanitizeName = (name) =>
+  name
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "_")
+    .replace(/_+/g, "_");
+
+async function createTable(tableName, columns) {
+  const columnDefs = columns.map((col) => `\`${col}\` TEXT`).join(", ");
+  const sql = `CREATE TABLE IF NOT EXISTS \`${tableName}\` (${columnDefs})`;
+  await db.promise().query(sql);
+}
 
 
-const readCSV = (filepath) => {
-  return new Promise((resolve, reject) => {
-    const results = [];
-    let headers = [];
+async function insertData(tableName, columns, data, batchSize = 1000) {
+  const colNames = columns.map((c) => `\`${c}\``).join(",");
 
-    fs.createReadStream(filepath)
-      .pipe(csv())
-      .on('headers', (h) => {
-        headers = h;
-      })
-      .on('data', (data) => results.push(data))
-      .on('end', () => resolve({ headers, data: results }))
-      .on('error', reject);
-  });
-};
+  for (let i = 0; i < data.length; i += batchSize) {
+    const batch = data.slice(i, i + batchSize);
 
-app.post('/upload', authenticateToken, upload.array('files'), async (req, res) => {
+    const values = batch.map((row) =>
+      columns.map((col) =>
+        row[col] !== undefined && row[col] !== "" ? row[col] : null
+      )
+    );
+
+    const placeholders = values
+      .map(() => `(${columns.map(() => "?").join(",")})`)
+      .join(",");
+
+    const flatValues = values.flat();
+
+    const sql = `
+      INSERT INTO \`${tableName}\` (${colNames})
+      VALUES ${placeholders}
+    `;
+
+    await db.promise().query(sql, flatValues);
+  }
+}
+
+
+// ======================
+// /upload ROUTE (SINGLE + MULTI MERGE)
+// ======================
+app.post("/upload", upload.array("files"), async (req, res) => {
   try {
-    const { name } = req.body;
-    const company = req.user.company_name || null;
-
     if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ success: false, error: 'No file uploaded' });
+      return res.status(400).json({ success: false, error: "No files uploaded" });
     }
 
-    let finalFilePath = '';
-    let finalFilename = '';
+    const companyName = req.user?.company || null;
+    const inputFileName = req.body.name || "Uploaded File";
 
-    // ✅ SINGLE FILE
+    // ==================================================
+    // 🔹 SINGLE FILE UPLOAD
+    // ==================================================
     if (req.files.length === 1) {
       const file = req.files[0];
-      finalFilename = file.filename;
-      finalFilePath = `/uploads/${finalFilename}`;
-    }
+      const filePath = path.join(__dirname, "uploads", file.filename);
 
-    // ✅ MULTIPLE FILES
-    if (req.files.length > 1) {
-
-      let allHeaders = [];
-      let allDataRaw = [];
-
-      for (let file of req.files) {
-        const filePath = path.join(__dirname, 'uploads', file.filename);
-        const { headers, data } = await readCSV(filePath);
-
-        const normalizedHeaders = headers.map(h => h.toLowerCase().trim());
-        allHeaders.push(normalizedHeaders);
-
-        const normalizedData = data.map(row => {
-          const newRow = {};
-          Object.keys(row).forEach(k => {
-            newRow[k.toLowerCase().trim()] = row[k];
-          });
-          return newRow;
-        });
-
-        allDataRaw.push(normalizedData);
+      const { headers, data } = await readCSV(filePath);
+      if (!headers.length) {
+        return res.status(400).json({ success: false, error: "Empty CSV" });
       }
 
-      // ✅ FIND COMMON PRIMARY KEY
-      const commonColumns = allHeaders.reduce((a, b) => a.filter(c => b.includes(c)));
-
-      if (commonColumns.length === 0) {
-        return res.status(400).json({
-          success: false,
-          error: '❌ No common primary key column found in all files'
+      const columns = headers.map(h => sanitizeName(h));
+      const normalizedData = data.map(row => {
+        const obj = {};
+        Object.keys(row).forEach(k => {
+          obj[sanitizeName(k)] = row[k];
         });
-      }
-
-      const primaryKey = commonColumns.includes('id')
-        ? 'id'
-        : commonColumns.includes('user_id')
-          ? 'user_id'
-          : commonColumns.includes('emp_id')
-            ? 'emp_id'
-            : commonColumns[0];
-
-      console.log("✅ Using primary key:", primaryKey);
-
-      allHeaders.forEach((headers, index) => {
-        if (!headers.includes(primaryKey)) {
-          throw new Error(`File ${index + 1} does not contain primary key: ${primaryKey}`);
-        }
+        return obj;
       });
 
-      // ✅ ALL COLUMNS (UNION)
-      const allColumnsSet = new Set();
-      allHeaders.forEach(h => h.forEach(c => allColumnsSet.add(c)));
-      let allColumns = Array.from(allColumnsSet);
+      const baseTableName = sanitizeName(
+        file.originalname.replace(/\.[^/.]+$/, "")
+      );
 
-      const map = new Map();
-      const duplicateTracker = new Set();
+      // 🔍 CHECK EXISTING TABLE
+      const [existing] = await db.promise().query(
+        "SHOW TABLES LIKE ?",
+        [baseTableName]
+      );
 
-      // ✅ SCAN AND DETECT MATCHES
-      for (const fileData of allDataRaw) {
-        for (const row of fileData) {
+      const isDuplicate = existing.length > 0;
+      const tableName = baseTableName;
 
-          if (!row[primaryKey] || row[primaryKey].toString().trim() === "") {
-            console.log("⚠️ Skipping row with missing primary key:", row);
-            continue;
-          }
-
-          const key = row[primaryKey].toString().trim();
-
-          if (!map.has(key)) {
-            const newObj = {};
-            allColumns.forEach(col => (newObj[col] = ""));
-            map.set(key, newObj);
-          } else {
-            duplicateTracker.add(key);
-          }
-
-          const target = map.get(key);
-
-          Object.keys(row).forEach(col => {
-            if (row[col] !== undefined && row[col] !== "") {
-              target[col] = row[col];
-            }
-          });
-        }
+      // 🆕 CREATE ONLY IF NOT EXISTS
+      if (!isDuplicate) {
+        await createTable(tableName, columns);
       }
 
-      // ✅ MOVE PRIMARY KEY TO FIRST COLUMN
-      const idx = allColumns.indexOf(primaryKey);
-      if (idx > 0) {
-        allColumns.splice(idx, 1);
-        allColumns.unshift(primaryKey);
-      }
+      // ➕ ALWAYS INSERT DATA
+      await insertData(tableName, columns, normalizedData, 1000);
 
-      let finalData = [];
-      let mergeType = "MERGED (JOIN)";
-
-      // ✅ IF NO MATCH → UNION
-      if (duplicateTracker.size === 0) {
-        console.log("⚠ No matching IDs found. Using UNION merge...");
-        finalData = Array.from(map.values());
-        mergeType = "UNION (APPENDED)";
-      } else {
-        console.log("✅ Matching IDs found. Using MERGE logic...");
-        finalData = Array.from(map.values());
-      }
-
-      const parser = new Parser({ fields: allColumns });
-      const mergedCSV = parser.parse(finalData);
-
-      finalFilename = `${mergeType.includes("UNION") ? 'union' : 'merged'}_${Date.now()}.csv`;
-      const mergedFilePath = path.join(__dirname, 'uploads', finalFilename);
-
-      fs.writeFileSync(mergedFilePath, mergedCSV);
-      finalFilePath = `/uploads/${finalFilename}`;
-
-      // ✅ DELETE ORIGINAL FILES
-      req.files.forEach(file => {
-        const oldPath = path.join(__dirname, 'uploads', file.filename);
-        if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-      });
-
-      // ✅ SAVE FILE INFO TO DATABASE
+      // 📄 SAVE FILE ENTRY
       await db.promise().query(
-        'INSERT INTO files (file_name, file_path, company_name) VALUES (?, ?, ?)',
-        [name, finalFilePath, company]
+        `INSERT INTO files 
+         (file_name, file_path, company_name, table_name, status)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          inputFileName,
+          file.path,
+          companyName,
+          tableName,
+          isDuplicate ? "CANCEL" : "DONE"
+        ]
       );
 
       return res.json({
         success: true,
-        message: `✅ File(s) processed successfully using ${mergeType} logic`,
-        file: {
-          file_name: name,
-          file_path: finalFilePath,
-          company_name: company
-        }
+        message: isDuplicate
+          ? "Duplicate file detected. Data appended."
+          : "File uploaded successfully",
+        tableName,
+        duplicate: isDuplicate
       });
     }
 
-    // ✅ FOR SINGLE FILE SAVE
-    await db.promise().query(
-      'INSERT INTO files (file_name, file_path, company_name) VALUES (?, ?, ?)',
-      [name, finalFilePath, company]
+    // ==================================================
+    // 🔹 MULTI FILE MERGE
+    // ==================================================
+    let allHeaders = [];
+    let allData = [];
+
+    for (const file of req.files) {
+      const filePath = path.join(__dirname, "uploads", file.filename);
+      const { headers, data } = await readCSV(filePath);
+
+      const normalizedHeaders = headers.map(h => sanitizeName(h));
+      allHeaders.push(normalizedHeaders);
+
+      const normalizedRows = data.map(row => {
+        const obj = {};
+        Object.keys(row).forEach(k => {
+          obj[sanitizeName(k)] = row[k];
+        });
+        return obj;
+      });
+
+      allData.push(normalizedRows);
+    }
+
+    const commonColumns = allHeaders.reduce((a, b) => a.filter(c => b.includes(c)));
+    if (!commonColumns.length) {
+      return res.status(400).json({ success: false, error: "No common key found" });
+    }
+
+    const primaryKey = commonColumns[0];
+    const allColumns = [...new Set(allHeaders.flat())];
+
+    const map = new Map();
+    const duplicateTracker = new Set();
+
+    for (const rows of allData) {
+      for (const row of rows) {
+        const key = row[primaryKey];
+        if (!key) continue;
+
+        if (!map.has(key)) {
+          const obj = {};
+          allColumns.forEach(c => (obj[c] = ""));
+          map.set(key, obj);
+        } else {
+          duplicateTracker.add(key);
+        }
+
+        Object.assign(map.get(key), row);
+      }
+    }
+
+    const finalData = Array.from(map.values());
+    const mergeType = duplicateTracker.size ? "merged" : "union";
+    const tableName = `${sanitizeName(inputFileName)}_${mergeType}`;
+
+    // 🔍 CHECK EXISTING MERGED TABLE
+    const [existing] = await db.promise().query(
+      "SHOW TABLES LIKE ?",
+      [tableName]
     );
 
-    res.json({
+    const isDuplicate = existing.length > 0;
+
+    if (!isDuplicate) {
+      await createTable(tableName, allColumns);
+    }
+
+    await insertData(tableName, allColumns, finalData, 1000);
+
+    await db.promise().query(
+      `INSERT INTO files 
+       (file_name, file_path, company_name, table_name, status)
+       VALUES (?, ?, ?, ?, ?)`,
+      [inputFileName, "MULTI_UPLOAD", companyName, tableName, isDuplicate ? "CANCEL" : "DONE"]
+    );
+
+    return res.json({
       success: true,
-      message: '✅ File uploaded successfully (single file)',
-      file: {
-        file_name: name,
-        file_path: finalFilePath,
-        company_name: company
-      }
+      message: "Multiple files processed",
+      tableName,
+      duplicate: isDuplicate
     });
 
   } catch (err) {
-    console.error('❌ Upload Error:', err.message);
-    res.status(500).json({ success: false, error: err.message || 'File upload failed' });
+    console.error("UPLOAD ERROR:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
+
+/// =============================
+// GET FILES (Uploaded + API + Processed)
 // =============================
-// GET FILES (Uploaded + API + Processed from DB)
-// =============================
-app.get('/files', authenticateToken, async (req, res) => {
+app.get("/files", authenticateToken, async (req, res) => {
   try {
     const company = req.user.company_name || null;
 
-    // -----------------------------------
-    // 1️⃣ Fetch Uploaded Files (NO DESC SORT)
-    // -----------------------------------
+    // =============================
+    // 1️⃣ UPLOADED FILES
+    // =============================
     const uploadedQuery = company
-      ? `SELECT id, file_name AS name, file_path AS path FROM files 
-         WHERE company_name = ? OR company_name IS NULL`
-      : `SELECT id, file_name AS name, file_path AS path FROM files 
-         WHERE company_name IS NULL`;
+      ? `SELECT 
+           id,
+           file_name AS name,
+           file_path AS path,
+           table_name,
+           status,
+           is_primary
+         FROM files
+         WHERE company_name = ? OR company_name IS NULL
+         ORDER BY id ASC`
+      : `SELECT 
+           id,
+           file_name AS name,
+           file_path AS path,
+           table_name,
+           status,
+           is_primary
+         FROM files
+         WHERE company_name IS NULL
+         ORDER BY id ASC`;
 
-    const [uploadedFiles] = await db.promise().query(uploadedQuery, company ? [company] : []);
+    const [uploadedFiles] = await db
+      .promise()
+      .query(uploadedQuery, company ? [company] : []);
 
     const uploadedFilesWithSource = uploadedFiles.map(f => ({
-      ...f,
-      source: "Uploaded",
+      id: `uploaded-${f.id}`,
+      name: f.name,
+      path: f.path,
+      table_name: f.table_name,
+      status: f.status,
+      is_primary: f.is_primary,
+      source: "Uploaded File",
       type: "uploaded"
     }));
 
-    // -----------------------------------
-    // 2️⃣ Fetch API Files (NO DESC SORT)
-    // -----------------------------------
-    const [apiFiles] = await db.promise().query(`
-      SELECT id, file_name AS name, file_path AS path 
-      FROM api_data
-    `);
-
-    const apiFilesWithSource = apiFiles.map(f => ({
-      ...f,
-      source: "API",
-      type: "api"
-    }));
-
-    // -----------------------------------
-    // 3️⃣ Merge Files (NO SORTING HERE)
-    // -----------------------------------
-    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource];
-
-    // -----------------------------------
-    // 4️⃣ Fetch Processed Folders (NO DESC SORT)
-    // -----------------------------------
-    const [folders] = await db.promise().query(`
-      SELECT id, folder_name, folder_path, tables_json 
-      FROM processed_files
-    `);
-
-    const processedSet = new Set(
-      folders.map(f => f.folder_name.trim().toLowerCase())
+    // =============================
+    // 2️⃣ API FILES
+    // =============================
+    const [apiFiles] = await db.promise().query(
+      `SELECT id, file_name AS name, file_path AS path FROM api_data`
     );
 
-    // -----------------------------------
-    // 5️⃣ Duplicate Map
-    // -----------------------------------
-    const duplicateMap = {};
-    allFiles.forEach((file, index) => {
-      const key = file.name.trim().toLowerCase();
-      if (!duplicateMap[key]) duplicateMap[key] = [];
-      duplicateMap[key].push(index);
+    const apiFilesWithSource = apiFiles.map(f => ({
+      id: `api-${f.id}`,
+      name: f.name,
+      path: f.path,
+      source: "API Data",
+      type: "api",
+      status: "DONE",
+      is_primary: 1
+    }));
+
+    // =============================
+    // 3️⃣ PROCESSED TABLES
+    // =============================
+    const [tables] = await db.promise().query(`SHOW TABLES`);
+
+    const processedMap = {};
+
+    tables.forEach(row => {
+      const tableName = Object.values(row)[0].toLowerCase();
+
+      if (
+        tableName.endsWith("_fulltable") ||
+        tableName.endsWith("_entity") ||
+        tableName.endsWith("_metrics") ||
+        tableName.endsWith("_dimension")
+      ) {
+        const baseName = tableName.replace(
+          /_(fulltable|entity|metrics|dimension)$/,
+          ""
+        );
+
+        if (!processedMap[baseName]) processedMap[baseName] = [];
+        processedMap[baseName].push(tableName);
+      }
     });
 
-    // -----------------------------------
-    // 6️⃣ Assign Status (NO SORT)
-    // -----------------------------------
-    const finalFiles = allFiles.map((file, index) => {
-      const name = file.name.trim().toLowerCase();
-      const indexes = duplicateMap[name];
-      const isProcessed = processedSet.has(name);
+    const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
+      id: `processed-${idx}`,
+      folderName: baseName,
+      tables: processedMap[baseName],
+      type: "processed",
+      status: "DONE"
+    }));
 
-      if (indexes[0] !== index) {
-        return { ...file, status: "CANCEL" };
+    // =============================
+    // 4️⃣ STATUS FIX (FINAL)
+    // =============================
+    const processedSet = new Set(
+      processedFolders.map(p => p.folderName.toLowerCase())
+    );
+
+    const getBaseName = (name = "") =>
+      name
+        .toLowerCase()
+        .replace(/\.[^/.]+$/, "")
+        .replace(/_v\d+$/, "");
+
+    const allFiles = [
+      ...uploadedFilesWithSource,
+      ...apiFilesWithSource
+    ].map(f => {
+      let baseName;
+
+      if (f.path === "MULTI_UPLOAD" && f.table_name) {
+        baseName = f.table_name.toLowerCase();
+      } else {
+        baseName = getBaseName(f.name);
       }
 
-      return { ...file, status: isProcessed ? "DONE" : "PROCESSING" };
-    });
-
-    // -----------------------------------
-    // 7️⃣ Format Processed Folders
-    // -----------------------------------
-    const processedFolders = folders.map(f => {
-      let tables = {};
-      try {
-        tables = f.tables_json ? JSON.parse(f.tables_json) : {};
-      } catch (err) {
-        console.error("JSON parse error", f.folder_name);
-      }
       return {
-        id: f.id,
-        folderName: f.folder_name,
-        folderPath: f.folder_path,
-        tables,
-        csvCount: Object.keys(tables).length,
-        type: "processed"
+        ...f,
+        status:
+          f.status === "CANCEL"
+            ? "CANCEL"
+            : processedSet.has(baseName)
+              ? "DONE"
+              : "PROCESSING"
       };
     });
 
-    // -----------------------------------
-    // 8️⃣ Final Response (Frontend Will Sort)
-    // -----------------------------------
+    // =============================
+    // 5️⃣ RESPONSE
+    // =============================
     res.json({
-      uploadedFiles: finalFiles,
+      uploadedFiles: allFiles,
       processedFolders
     });
 
   } catch (err) {
-    console.error('❌ Fetch Files Error:', err);
-    res.status(500).json({ success: false, error: 'Error fetching files' });
+    console.error("❌ Fetch Files Error:", err);
+    res.status(500).json({ error: "Error fetching files" });
   }
 });
 
 
 // =============================
-// GET CSV files inside a processed folder by folder ID
+// GET PROCESSED TABLE DATA
 // =============================
-app.get('/processed-folder/:id', authenticateToken, async (req, res) => {
+app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
   try {
-    const folderId = req.params.id;
+    const tableName = req.params.tableName;
 
-    const [folders] = await db.promise().query(
-      'SELECT * FROM processed_files WHERE id = ?',
-      [folderId]
-    );
+    const [rows] = await db
+      .promise()
+      .query(`SELECT * FROM \`${tableName}\``);
 
-    if (!folders.length) return res.status(404).json({ error: 'Folder not found' });
-
-    const folder = folders[0];
-    const folderPath = folder.folder_path;
-
-    if (!fs.existsSync(folderPath)) return res.status(404).json({ error: 'Folder path does not exist' });
-
-    const files = fs.readdirSync(folderPath)
-      .filter(f => f.endsWith('.csv'))
-      .map(f => ({
-        name: f,
-        path: `/uploads/processed/${path.basename(folderPath)}/${f}` // Adjust URL path if needed
-      }));
-
-    res.json({ folder: { id: folder.id, folderName: folder.folder_name, files } });
+    res.json({
+      tableName,
+      rows
+    });
 
   } catch (err) {
-    console.error('❌ Fetch Processed Folder Error:', err);
-    res.status(500).json({ success: false, error: 'Error fetching processed folder' });
+    console.error("❌ Fetch Processed Table Error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Error fetching processed table"
+    });
   }
 });
+
 
 // In-memory cache for repeated queries (optional)
 const queryCache = {};
