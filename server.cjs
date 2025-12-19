@@ -21,11 +21,13 @@ const port = 5000;
 require('dotenv').config();
 
 // CommonJS require
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // Initialize the OpenAI client
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 
 // ✅ JWT Secret Key
 const secret_key = 'f8a0c1b6d2e9-42ad-9a3f-57b4a0c9e2f'; // 🔥 Add this line
@@ -67,20 +69,24 @@ if (!fs.existsSync(uploadDir)) {
 // =============================
 // DATABASE CONNECTION
 // =============================
-const db = mysql.createConnection({
+const db = mysql.createPool({
   host: 'localhost',
   user: 'root',
   password: '8080',
   database: 'file_upload_db',
 });
 
-db.connect((err) => {
-  if (err) {
-    console.error('❌ MySQL connection failed:', err);
-    process.exit(1);
-  }
-  console.log('✅ Connected to MySQL Database');
-});
+
+const promiseDb = db.promise();
+
+
+// db.connect((err) => {
+//   if (err) {
+//     console.error('❌ MySQL connection failed:', err);
+//     process.exit(1);
+//   }
+//   console.log('✅ Connected to MySQL Database');
+// });
 
 
 
@@ -1042,145 +1048,6 @@ app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
 });
 
 
-// In-memory cache for repeated queries (optional)
-const queryCache = {};
-
-// POST /ask-ai
-app.post('/ask-ai', authenticateToken, async (req, res) => {
-  try {
-    const { folderId, query } = req.body;
-
-    if (!folderId || !query) {
-      return res.status(400).json({ success: false, error: "folderId and query required" });
-    }
-
-    // Check cache first
-    if (queryCache[folderId]?.[query]) {
-      console.log("Returning cached response for this query");
-      return res.json(queryCache[folderId][query]);
-    }
-
-    // 1️⃣ Get folder info from DB
-    const [folderRows] = await db.promise().query(
-      "SELECT folder_name, folder_path FROM processed_files WHERE id = ?",
-      [folderId]
-    );
-
-    if (!folderRows.length) {
-      return res.status(404).json({ success: false, error: "Folder not found" });
-    }
-
-    const { folder_path } = folderRows[0];
-    if (!fs.existsSync(folder_path)) {
-      return res.status(404).json({ success: false, error: "Folder path does not exist" });
-    }
-
-    // 2️⃣ Select the largest CSV file
-    const fileNames = fs.readdirSync(folder_path);
-    const csvFiles = fileNames.filter(f => f.endsWith(".csv"));
-    if (!csvFiles.length) {
-      return res.json({ summary: "No CSV files found in this folder.", rows: [] });
-    }
-
-    let largestFile = "";
-    let largestSize = 0;
-    for (const file of csvFiles) {
-      const stats = fs.statSync(path.join(folder_path, file));
-      if (stats.size > largestSize) {
-        largestSize = stats.size;
-        largestFile = file;
-      }
-    }
-
-    const largestPath = path.join(folder_path, largestFile);
-    let csvContent = fs.readFileSync(largestPath, "utf8");
-
-    // 3️⃣ Sample CSV rows to avoid sending huge data
-    function sampleCsvRows(csvText, maxRows = 100) {
-      const lines = csvText.split(/\r?\n/);
-      if (lines.length <= maxRows + 1) return csvText; // include header
-      const headers = lines[0];
-      const rows = lines.slice(1, maxRows + 1);
-      return [headers, ...rows].join("\n");
-    }
-    const combinedData = sampleCsvRows(csvContent);
-
-    // 4️⃣ Send data + query to OpenAI
-    let aiResponse;
-    const models = ["gpt-4o-mini", "gpt-3.5-turbo"];
-    for (const model of models) {
-      try {
-        aiResponse = await client.chat.completions.create({
-          model,
-          temperature: 0.1,
-          messages: [
-            {
-              role: "system",
-              content: `
-You are a data analysis engine.
-Return JSON in this exact format:
-{
-  "summary": "AI text summary",
-  "rows": [
-    { "Column1": value, "Column2": value },
-    ...
-  ]
-}
-Rules:
-- Only return rows relevant to the question.
-- Use numeric values when possible.
-- summary is plain text.
-`
-            },
-            {
-              role: "user",
-              content: `DATA:\n${combinedData}\nQUESTION: ${query}`
-            }
-          ]
-        });
-        break;
-      } catch (err) {
-        console.error(`OpenAI error with model ${model}:`, err.response?.data || err.message);
-        if (model === models[models.length - 1]) {
-          return res.status(500).json({
-            success: false,
-            error: "OpenAI request failed",
-            details: err.response?.data || err.message
-          });
-        }
-      }
-    }
-
-    const text = aiResponse.choices[0]?.message?.content;
-
-    // 5️⃣ Safe JSON parsing
-    function safeJsonParse(text) {
-      try {
-        return JSON.parse(text);
-      } catch {
-        const fixed = text.replace(/(\r\n|\n|\r)/gm, '').replace(/'/g, '"');
-        try {
-          return JSON.parse(fixed);
-        } catch {
-          return null;
-        }
-      }
-    }
-
-    const parsed = safeJsonParse(text) || { summary: "No result returned", rows: [] };
-
-    // 6️⃣ Save in cache
-    queryCache[folderId] = queryCache[folderId] || {};
-    queryCache[folderId][query] = parsed;
-
-    res.json(parsed);
-
-  } catch (err) {
-    console.error("Unexpected server error:", err.message, err.stack);
-    res.status(500).json({ success: false, error: "Server error" });
-  }
-});
-
 // =============================
 // ✅ OPENAI CHAT API
 // =============================
@@ -1374,6 +1241,49 @@ app.put('/change-mobile', async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
+// ------------------------
+// NLQ SEARCH ROUTE
+// ------------------------
+app.post("/nlq-search", async (req, res) => {
+  try {
+    const { question, tableName } = req.body;
+
+    if (!question || !tableName) {
+      return res.status(400).json({ error: "Missing question or tableName" });
+    }
+
+    // 1️⃣ Fetch table rows
+    const [rows] = await promiseDb.query(`SELECT * FROM \`${tableName}\``);
+    if (!rows.length) {
+      return res.status(404).json({ error: "Table is empty" });
+    }
+
+    // 2️⃣ Convert table to JSON string (simplified for OpenAI)
+    const tableText = JSON.stringify(rows.slice(0, 50)); // limit rows to avoid huge prompt
+
+    // 3️⃣ Call OpenAI
+   const response = await openai.chat.completions.create({
+  model: "gpt-3.5-turbo",  // change from "gpt-4"
+  messages: [
+    { role: "system", content: "You are a helpful assistant." },
+    { role: "user", content: `Question: ${question}\nTable Data: ${tableText}` },
+  ],
+  max_tokens: 500,
+});
+
+
+    // 4️⃣ Extract answer
+    const answer = response.choices?.[0]?.message?.content || "No answer";
+
+    // 5️⃣ Return structured JSON
+    res.json([{ result: answer }]);
+  } catch (err) {
+    console.error("❌ NLQ Error FULL:", err);
+    res.status(500).json({ error: "NLQ failed" });
+  }
+});
+
 
 
 // =============================
