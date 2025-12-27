@@ -14,6 +14,9 @@ const fs = require('fs-extra');
 const OpenAI = require("openai");
 const axios = require('axios');
 const readCSV = require("./utils/readCSV.cjs")
+const { CohereClient } = require("cohere-ai");
+
+
 
 const app = express();
 const port = 5000;
@@ -728,118 +731,194 @@ async function insertData(tableName, columns, data, batchSize = 1000) {
   }
 }
 
+// ======================
+// HELPER FUNCTIONS (ADD HERE)
+// ======================
+function safeFileName(name) {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")      // spaces → _
+    .replace(/[^a-z0-9_]/g, ""); // remove special chars
+}
+
 
 // ======================
-// /upload ROUTE (DUPLICATE → CANCEL)
+// /upload ROUTE (CLEAN FINAL VERSION)
 // ======================
-app.post("/upload", upload.array("files"), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({ success: false, error: "No files uploaded" });
-    }
 
-    const companyName = req.user?.company || null;
-    const inputFileName = req.body.name?.trim() || "Uploaded_File";
-
-    // ==================================================
-    // SAVE FILES (DUPLICATE = CANCEL)
-    // ==================================================
-    for (let i = 0; i < req.files.length; i++) {
-      const file = req.files[i];
-
-      const finalFileName =
-        req.files.length === 1
-          ? inputFileName
-          : `${inputFileName}_${i + 1}`;
-
-      // 🔍 Check already uploaded (any status)
-      const [existing] = await db.promise().query(
-        `SELECT id FROM files
-         WHERE file_name = ?
-         AND company_name <=> ?`,
-        [finalFileName, companyName]
-      );
-
-      // ✅ Decide status
-      const status = existing.length > 0 ? "CANCEL" : "NEW";
-
-      // 💾 Always save in DB
-      await db.promise().query(
-        `INSERT INTO files (file_name, file_path, company_name, status)
-         VALUES (?, ?, ?, ?)`,
-        [finalFileName, file.path, companyName, status]
-      );
-    }
-
-    // ==================================================
-    // SINGLE FILE PROCESSING
-    // ==================================================
-    if (req.files.length === 1 && req.body.process === "true") {
-      const file = req.files[0];
-      const filePath = path.join(__dirname, "uploads", file.filename);
-
-      const { headers, data } = await readCSV(filePath);
-      if (!headers.length) {
-        return res.status(400).json({ success: false, error: "Empty CSV" });
-      }
-
-      const columns = headers.map(h => sanitizeName(h));
-      const normalizedData = data.map(row => {
-        const obj = {};
-        Object.keys(row).forEach(k => {
-          obj[sanitizeName(k)] = row[k];
+app.post(
+  "/upload",
+  authenticateToken,
+  upload.array("files"),
+  async (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "No files uploaded"
         });
-        return obj;
-      });
-
-      const baseTableName = sanitizeName(inputFileName);
-
-      const [existing] = await db.promise().query(
-        "SHOW TABLES LIKE ?",
-        [baseTableName]
-      );
-
-      const isDuplicate = existing.length > 0;
-
-      if (!isDuplicate) {
-        await createTable(baseTableName, columns);
-        await insertData(baseTableName, columns, normalizedData, 1000);
       }
 
-      await db.promise().query(
-        `UPDATE files SET table_name = ?, status = ?
-         WHERE file_path = ?`,
-        [baseTableName, isDuplicate ? "CANCEL" : "DONE", file.path]
-      );
+      const companyName = req.user?.company_name || null;
+      const rawName = req.body.name || "uploaded_file";
+      const baseFileName = safeFileName(rawName);
 
-      return res.json({
-        success: true,
-        message: isDuplicate
-          ? "Duplicate file. Marked as CANCEL"
-          : "File processed successfully"
+      // ==================================================
+      // SINGLE FILE FLOW
+      // ==================================================
+      if (req.files.length === 1) {
+        const file = req.files[0];
+        const finalFilename = `${baseFileName}.csv`;
+        const finalPath = path.join(__dirname, "uploads", finalFilename);
+
+        fs.renameSync(file.path, finalPath);
+
+        const [existing] = await db.promise().query(
+          `SELECT id FROM files
+           WHERE file_name = ?
+           AND company_name <=> ?`,
+          [baseFileName, companyName]
+        );
+
+        const status = existing.length > 0 ? "CANCEL" : "NEW";
+
+        await db.promise().query(
+          `INSERT INTO files (file_name, file_path, company_name, status)
+           VALUES (?, ?, ?, ?)`,
+          [
+            baseFileName,
+            `/uploads/${finalFilename}`,
+            companyName,
+            status
+          ]
+        );
+
+        return res.json({
+          success: true,
+          message: "File uploaded successfully",
+          file: finalFilename
+        });
+      }
+
+      // ==================================================
+      // MULTI FILE FLOW (MERGE → ONE FILE)
+      // ==================================================
+      if (req.files.length > 1) {
+        let allHeaders = [];
+        let allDataRaw = [];
+
+        for (const file of req.files) {
+          const { headers, data } = await readCSV(file.path);
+
+          const normalizedHeaders = headers.map(h => sanitizeName(h));
+          allHeaders.push(normalizedHeaders);
+
+          const normalizedData = data.map(row => {
+            const obj = {};
+            Object.keys(row).forEach(k => {
+              obj[sanitizeName(k)] = row[k];
+            });
+            return obj;
+          });
+
+          allDataRaw.push(normalizedData);
+        }
+
+        const commonColumns = allHeaders.reduce((a, b) =>
+          a.filter(c => b.includes(c))
+        );
+
+        if (commonColumns.length === 0) {
+          return res.status(400).json({
+            success: false,
+            error: "No common primary key found"
+          });
+        }
+
+        const primaryKey =
+          commonColumns.includes("id") ? "id" :
+          commonColumns.includes("user_id") ? "user_id" :
+          commonColumns.includes("emp_id") ? "emp_id" :
+          commonColumns[0];
+
+        const allColumnsSet = new Set();
+        allHeaders.forEach(h => h.forEach(c => allColumnsSet.add(c)));
+        let allColumns = Array.from(allColumnsSet);
+
+        const map = new Map();
+        for (const fileData of allDataRaw) {
+          for (const row of fileData) {
+            if (!row[primaryKey]) continue;
+
+            const key = row[primaryKey].toString().trim();
+            if (!map.has(key)) {
+              const obj = {};
+              allColumns.forEach(c => (obj[c] = ""));
+              map.set(key, obj);
+            }
+
+            const target = map.get(key);
+            Object.keys(row).forEach(col => {
+              if (row[col] !== "") target[col] = row[col];
+            });
+          }
+        }
+
+        allColumns = [
+          primaryKey,
+          ...allColumns.filter(c => c !== primaryKey)
+        ];
+
+        const parser = new Parser({ fields: allColumns });
+        const mergedCSV = parser.parse(Array.from(map.values()));
+
+        // 🔥 USE USER FILE NAME
+        let finalFilename = `${baseFileName}.csv`;
+        let finalPath = path.join(__dirname, "uploads", finalFilename);
+
+        // avoid overwrite
+        let counter = 1;
+        while (fs.existsSync(finalPath)) {
+          finalFilename = `${baseFileName}_${counter}.csv`;
+          finalPath = path.join(__dirname, "uploads", finalFilename);
+          counter++;
+        }
+
+        fs.writeFileSync(finalPath, mergedCSV);
+
+        // delete temp uploads
+        req.files.forEach(f => {
+          if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
+        });
+
+        // save ONLY merged file
+        await db.promise().query(
+          `INSERT INTO files (file_name, file_path, company_name, status)
+           VALUES (?, ?, ?, 'NEW')`,
+          [
+            baseFileName,
+            `/uploads/${finalFilename}`,
+            companyName
+          ]
+        );
+
+        return res.json({
+          success: true,
+          message: "Files merged successfully",
+          file: finalFilename
+        });
+      }
+
+    } catch (err) {
+      console.error("❌ UPLOAD ERROR:", err);
+      return res.status(500).json({
+        success: false,
+        error: err.message
       });
     }
-
-    // ==================================================
-    // MULTI FILE PROCESSING (UNCHANGED)
-    // ==================================================
-    // (same as your existing code)
-
-    return res.json({
-      success: true,
-      message: "Files uploaded",
-      uploaded: req.files.length
-    });
-
-  } catch (err) {
-    console.error("UPLOAD ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message
-    });
   }
-});
-
+);
 
 /// =============================
 // GET FILES (Uploaded + API + Processed)
@@ -1220,49 +1299,62 @@ app.put('/change-mobile', async (req, res) => {
   }
 });
 
+
+
+// Initialize once
+const cohere = new CohereClient({
+  token: process.env.COHERE_API_KEY
+});
+
 // ------------------------
-// NLQ SEARCH ROUTE
+// NLQ SEARCH ROUTE (COHERE - FREE)
 // ------------------------
 app.post("/nlq-search", async (req, res) => {
   try {
     const { question, tableName } = req.body;
 
     if (!question || !tableName) {
-      return res.status(400).json({ error: "Missing question or tableName" });
+      return res.status(400).json({ error: "Missing input" });
     }
 
-    // 1️⃣ Fetch table rows
-    const [rows] = await promiseDb.query(`SELECT * FROM \`${tableName}\``);
+    // Fetch sample rows
+    const [rows] = await promiseDb.query(
+      `SELECT * FROM \`${tableName}\` LIMIT 20`
+    );
+
     if (!rows.length) {
       return res.status(404).json({ error: "Table is empty" });
     }
 
-    // 2️⃣ Convert table to JSON string (simplified for OpenAI)
-    const tableText = JSON.stringify(rows.slice(0, 50)); // limit rows to avoid huge prompt
+    const prompt = `
+Answer the question using the table data.
 
-    // 3️⃣ Call OpenAI
-    const response = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",  // change from "gpt-4"
-      messages: [
-        { role: "system", content: "You are a helpful assistant." },
-        { role: "user", content: `Question: ${question}\nTable Data: ${tableText}` },
-      ],
-      max_tokens: 500,
+Question:
+${question}
+
+Table Data:
+${JSON.stringify(rows)}
+
+Give a short answer.
+`;
+
+    const response = await cohere.generate({
+      model: "command-light", // free-tier model
+      prompt,
+      maxTokens: 150,
+      temperature: 0.3,
     });
 
-
-    // 4️⃣ Extract answer
-    const answer = response.choices?.[0]?.message?.content || "No answer";
-
-    // 5️⃣ Return structured JSON
-    res.json([{ result: answer }]);
+    res.json([
+      {
+        result: response.generations[0].text.trim(),
+      },
+    ]);
   } catch (err) {
-    console.error("❌ NLQ Error FULL:", err);
+    console.error("❌ Cohere NLQ Error:", err);
     res.status(500).json({ error: "NLQ failed" });
   }
 });
-
-
 
 // =============================
 // START SERVER
