@@ -1110,16 +1110,15 @@ app.post("/upload", authenticateToken, (req, res, next) => {
 }
 );
 
+/// =============================
+// GET FILES (Uploaded + API + Processed)
+// =============================
 app.get("/files", authenticateToken, async (req, res) => {
   try {
-    // 🔑 company decide pannrom
-    const company =
-      req.user.viewOnly
-        ? req.user.company_name           // 👀 view user
-        : req.user.company_name || null;  // 🔑 full user
+    const company = req.user.company_name || null;
 
     // =============================
-    // 1️⃣ UPLOADED FILES
+    // 1️⃣ UPLOADED FILES (FIXED)
     // =============================
     const uploadedQuery = company
       ? `SELECT 
@@ -1130,7 +1129,7 @@ app.get("/files", authenticateToken, async (req, res) => {
            status,
            is_primary
          FROM files
-         WHERE company_name = ? OR company_name IS NULL
+         WHERE company_name = ?
          ORDER BY id ASC`
       : `SELECT 
            id,
@@ -1161,11 +1160,16 @@ app.get("/files", authenticateToken, async (req, res) => {
     // =============================
     // 2️⃣ API FILES (FIXED)
     // =============================
+    const apiQuery = company
+      ? `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name = ?`
+      : `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name IS NULL`;
+
     const [apiFiles] = await db.promise().query(
-      company
-        ? `SELECT id, file_name AS name, file_path AS path
-           FROM api_data WHERE company_name = ?`
-        : `SELECT id, file_name AS name, file_path AS path`,
+      apiQuery,
       company ? [company] : []
     );
 
@@ -1180,8 +1184,21 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 3️⃣ PROCESSED TABLES
+    // 3️⃣ PROCESSED TABLES (AUTO-FIXED)
     // =============================
+    const allowedFilesQuery = company
+      ? `SELECT file_name FROM files WHERE company_name = ?`
+      : `SELECT file_name FROM files WHERE company_name IS NULL`;
+
+    const [allowedFiles] = await db.promise().query(
+      allowedFilesQuery,
+      company ? [company] : []
+    );
+
+    const allowedBaseNames = new Set(
+      allowedFiles.map(f => f.file_name.toLowerCase())
+    );
+
     const [tables] = await db.promise().query(`SHOW TABLES`);
 
     const processedMap = {};
@@ -1189,20 +1206,17 @@ app.get("/files", authenticateToken, async (req, res) => {
     tables.forEach(row => {
       const tableName = Object.values(row)[0].toLowerCase();
 
-      if (
-        tableName.endsWith("_fulltable") ||
-        tableName.endsWith("_entity") ||
-        tableName.endsWith("_metrics") ||
-        tableName.endsWith("_dimension")
-      ) {
-        const baseName = tableName.replace(
-          /_(fulltable|entity|metrics|dimension)$/,
-          ""
-        );
+      const match = tableName.match(
+        /(.+)_(fulltable|entity|metrics|dimension)$/
+      );
 
-        if (!processedMap[baseName]) processedMap[baseName] = [];
-        processedMap[baseName].push(tableName);
-      }
+      if (!match) return;
+
+      const baseName = match[1];
+      if (!allowedBaseNames.has(baseName)) return;
+
+      if (!processedMap[baseName]) processedMap[baseName] = [];
+      processedMap[baseName].push(tableName);
     });
 
     const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
@@ -1214,26 +1228,25 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 4️⃣ STATUS FIX
+    // 4️⃣ STATUS FIX (UNCHANGED)
     // =============================
     const processedSet = new Set(
       processedFolders.map(p => p.folderName.toLowerCase())
     );
 
     const getBaseName = (name = "") =>
-      name.toLowerCase().replace(/\.[^/.]+$/, "").replace(/_v\d+$/, "");
+      name.toLowerCase().replace(/\.[^/.]+$/, "");
 
-    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource].map(f => {
-      let baseName =
-        f.path === "MULTI_UPLOAD" && f.table_name
-          ? f.table_name.toLowerCase()
-          : getBaseName(f.name);
+    const allFiles = [
+      ...uploadedFilesWithSource,
+      ...apiFilesWithSource
+    ].map(f => {
+      const baseName = getBaseName(f.name);
 
-      let finalStatus = "NEW";
-
+      let finalStatus;
       if (f.status === "CANCEL") finalStatus = "CANCEL";
       else if (processedSet.has(baseName)) finalStatus = "DONE";
-      else if (f.status && f.status !== "NEW") finalStatus = "PROCESSING";
+      else finalStatus = "NEW";
 
       return { ...f, status: finalStatus };
     });
