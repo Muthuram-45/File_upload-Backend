@@ -1269,6 +1269,165 @@ app.get("/files", authenticateToken, async (req, res) => {
 // =============================
 // GET PROCESSED TABLE DATA
 // =============================
+/// =============================
+// GET FILES (Uploaded + API + Processed)
+// =============================
+app.get("/files", authenticateToken, async (req, res) => {
+  try {
+    const company = req.user.company_name || null;
+
+    // =============================
+    // 1️⃣ UPLOADED FILES (FIXED)
+    // =============================
+    const uploadedQuery = company
+      ? `SELECT 
+           id,
+           file_name AS name,
+           file_path AS path,
+           table_name,
+           status,
+           is_primary
+         FROM files
+         WHERE company_name = ?
+         ORDER BY id ASC`
+      : `SELECT 
+           id,
+           file_name AS name,
+           file_path AS path,
+           table_name,
+           status,
+           is_primary
+         FROM files
+         WHERE company_name IS NULL
+         ORDER BY id ASC`;
+
+    const [uploadedFiles] = await db
+      .promise()
+      .query(uploadedQuery, company ? [company] : []);
+
+    const uploadedFilesWithSource = uploadedFiles.map(f => ({
+      id: `uploaded-${f.id}`,
+      name: f.name,
+      path: f.path,
+      table_name: f.table_name,
+      status: f.status,
+      is_primary: f.is_primary,
+      source: "Uploaded File",
+      type: "uploaded"
+    }));
+
+    // =============================
+    // 2️⃣ API FILES (FIXED)
+    // =============================
+    const apiQuery = company
+      ? `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name = ?`
+      : `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name IS NULL`;
+
+    const [apiFiles] = await db.promise().query(
+      apiQuery,
+      company ? [company] : []
+    );
+
+    const apiFilesWithSource = apiFiles.map(f => ({
+      id: `api-${f.id}`,
+      name: f.name,
+      path: f.path,
+      source: "API Data",
+      type: "api",
+      status: "DONE",
+      is_primary: 1
+    }));
+
+    // =============================
+    // 3️⃣ PROCESSED TABLES (AUTO-FIXED)
+    // =============================
+    const allowedFilesQuery = company
+      ? `SELECT file_name FROM files WHERE company_name = ?`
+      : `SELECT file_name FROM files WHERE company_name IS NULL`;
+
+    const [allowedFiles] = await db.promise().query(
+      allowedFilesQuery,
+      company ? [company] : []
+    );
+
+    const allowedBaseNames = new Set(
+      allowedFiles.map(f => f.file_name.toLowerCase())
+    );
+
+    const [tables] = await db.promise().query(`SHOW TABLES`);
+
+    const processedMap = {};
+
+    tables.forEach(row => {
+      const tableName = Object.values(row)[0].toLowerCase();
+
+      const match = tableName.match(
+        /(.+)_(fulltable|entity|metrics|dimension)$/
+      );
+
+      if (!match) return;
+
+      const baseName = match[1];
+      if (!allowedBaseNames.has(baseName)) return;
+
+      if (!processedMap[baseName]) processedMap[baseName] = [];
+      processedMap[baseName].push(tableName);
+    });
+
+    const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
+      id: `processed-${idx}`,
+      folderName: baseName,
+      tables: processedMap[baseName],
+      type: "processed",
+      status: "DONE"
+    }));
+
+    // =============================
+    // 4️⃣ STATUS FIX (UNCHANGED)
+    // =============================
+    const processedSet = new Set(
+      processedFolders.map(p => p.folderName.toLowerCase())
+    );
+
+    const getBaseName = (name = "") =>
+      name.toLowerCase().replace(/\.[^/.]+$/, "");
+
+    const allFiles = [
+      ...uploadedFilesWithSource,
+      ...apiFilesWithSource
+    ].map(f => {
+      const baseName = getBaseName(f.name);
+
+      let finalStatus;
+      if (f.status === "CANCEL") finalStatus = "CANCEL";
+      else if (processedSet.has(baseName)) finalStatus = "DONE";
+      else finalStatus = "NEW";
+
+      return { ...f, status: finalStatus };
+    });
+
+    // =============================
+    // 5️⃣ RESPONSE
+    // =============================
+    res.json({
+      uploadedFiles: allFiles,
+      processedFolders
+    });
+
+  } catch (err) {
+    console.error("❌ Fetch Files Error:", err);
+    res.status(500).json({ error: "Error fetching files" });
+  }
+});
+
+
+// =============================
+// GET PROCESSED TABLE DATA
+// =============================
 app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
   try {
     const tableName = req.params.tableName;
