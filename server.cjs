@@ -292,7 +292,7 @@ app.post('/company-register', async (req, res) => {
 // =============================
 app.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body
     if (!email || !password)
       return res.status(400).json({ success: false, error: 'Email and password required' });
 
@@ -310,7 +310,17 @@ app.post('/login', async (req, res) => {
     // ✅ UPDATE LAST LOGIN
     await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
 
-    const token = jwt.sign({ id: user.id, email: user.email }, secret_key, { expiresIn: '24h' });
+
+      const token = jwt.sign(
+      {
+        id: user.id,                  // 👈 ADD THIS
+        email: user.email,
+        company_name: user.company_name || null
+      },
+      secret_key,
+      { expiresIn: '24h' }
+    );
+
 
     res.json({
       success: true,
@@ -361,7 +371,7 @@ app.post('/company-login', async (req, res) => {
     await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
 
     const token = jwt.sign(
-      { id: user.id, email: user.email, company_name: user.company_name, mobile: user.mobile },
+      { id: user.id, email: user.email, company_name: user.company_name || null, mobile: user.mobile },
       secret_key,
       { expiresIn: '24h' }
     );
@@ -386,6 +396,109 @@ app.post('/company-login', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal Server Error' });
   }
 });
+
+
+app.post("/invite-employee", authenticateToken, async (req, res) => {
+  try {
+    const { email, accessType } = req.body;
+    const inviter = req.user;
+
+    if (!inviter.company_name) {
+      return res.status(403).json({
+        success: false,
+        error: "Only company users can invite employees",
+      });
+    }
+
+    const inviterDomain = inviter.email.split("@")[1];
+    const inviteeDomain = email.split("@")[1];
+
+    if (inviterDomain !== inviteeDomain) {
+      return res.status(400).json({
+        success: false,
+        error: `You can invite only @${inviterDomain} email users`,
+      });
+    }
+
+    const inviteToken = jwt.sign(
+      {
+        email,
+        company_name: inviter.company_name,
+        accessType, // "login" or "view"
+      },
+      secret_key,
+      { expiresIn: "48h" }
+    );
+
+    // 🔥 ALWAYS go via invite-redirect
+    const inviteLink = `http://localhost:5173/invite-redirect?token=${inviteToken}`;
+
+    await transporter.sendMail({
+      from: "Cloud360 <muthuram921@gmail.com>",
+      to: email,
+      subject: "Cloud360 Employee Invitation",
+      html: `
+        <p>You are invited to Cloud360.</p>
+        <p>Access type: <b>${accessType.toUpperCase()}</b></p>
+        <a href="${inviteLink}">Click here to continue</a>
+      `,
+    });
+
+    res.json({ success: true, message: "Invite sent successfully" });
+  } catch (err) {
+    console.error("Invite Error:", err);
+    res.status(500).json({ success: false, error: "Invite failed" });
+  }
+});
+
+
+app.get("/verify-invite", (req, res) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) {
+      return res.status(400).json({ success: false });
+    }
+
+    const decoded = jwt.verify(token, secret_key);
+
+    // 👀 VIEW ACCESS
+    if (decoded.accessType === "view") {
+      const viewToken = jwt.sign(
+        {
+          email: decoded.email,
+          company_name: decoded.company_name,
+          viewOnly: true,
+        },
+        secret_key,
+        { expiresIn: "6h" }
+      );
+
+      return res.json({
+        success: true,
+        access: "view",
+        email: decoded.email,
+        company_name: decoded.company_name,
+        viewToken,
+      });
+    }
+
+    // 🔑 LOGIN ACCESS
+    return res.json({
+      success: true,
+      access: "login",
+      email: decoded.email,
+      company_name: decoded.company_name,
+    });
+
+  } catch (err) {
+    console.error("Verify invite error:", err.message);
+    return res.status(400).json({ success: false });
+  }
+});
+
+
+
 
 // =============================
 // GOOGLE LOGIN
@@ -424,8 +537,15 @@ app.post('/google-login', async (req, res) => {
       await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [new Date(), user.id]);
     }
 
-    const appToken = jwt.sign({ id: user.id, email: user.email }, secret_key, { expiresIn: '24h' });
-
+    const appToken = jwt.sign(
+      {
+        id: user.id,                  // 👈 ADD THIS
+        email: user.email,
+        company_name: user.company_name || null
+      },
+      secret_key,
+      { expiresIn: '24h' }
+    );
 
     res.json({
       success: true,
@@ -484,81 +604,95 @@ app.get('/user/:email', async (req, res) => {
 // AUTH MIDDLEWARE
 // =============================
 function authenticateToken(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization;
+  const authHeader = req.headers.authorization;
 
-    console.log("Auth Header received:", authHeader);
-
-    if (!authHeader) {
-      return res.status(403).json({ error: "Authorization header missing" });
-    }
-
-    if (!authHeader.startsWith("Bearer ")) {
-      return res.status(403).json({ error: "Invalid token format" });
-    }
-
-    const token = authHeader.split(" ")[1];
-
-    jwt.verify(token, secret_key, (err, user) => {
-      if (err) {
-        console.log("JWT verify error:", err.message);
-
-        if (err.name === "TokenExpiredError") {
-          return res.status(403).json({ error: "Token expired. Please login again." });
-        }
-
-        return res.status(403).json({ error: "Invalid token" });
-      }
-
-      console.log("✅ User verified:", user);
-
-      req.user = user;   // VERY IMPORTANT
-      next();            // continue to /files route
-    });
-
-  } catch (error) {
-    console.log("Middleware crash:", error.message);
-    return res.status(500).json({ error: "Server middleware error" });
+  if (!authHeader) {
+    return res.status(401).json({ error: "Token missing" });
   }
+
+  const token = authHeader.split(" ")[1];
+
+  jwt.verify(token, secret_key, (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ error: "Invalid token" });
+    }
+
+    // ✅ SUPPORTS:
+    // - public user
+    // - company user
+    // - invited view-only user
+    req.user = {
+      id: decoded.id,                         // 👈 REQUIRED (user_id)
+      email: decoded.email,
+      company_name: decoded.company_name || null,
+      viewOnly: decoded.viewOnly || false,
+    };
+
+    next();
+  });
 }
 
-app.get('/fetch-api', async (req, res) => {
+
+
+app.get("/fetch-api", authenticateToken, async (req, res) => {
   try {
+    // 🚫 BLOCK VIEW-ONLY USERS (UPLOAD PAGE CONCEPT)
+    if (req.user.viewOnly) {
+      return res.status(403).json({
+        success: false,
+        error: "You have view-only access. Fetch API is disabled."
+      });
+    }
+
     const { url } = req.query;
-    const token = req.headers.authorization || req.headers["x-api-key"];
 
     if (!url) {
-      return res.status(400).json({ error: "API URL required" });
+      return res.status(400).json({
+        success: false,
+        error: "API URL required"
+      });
     }
+
+    // 🔐 Forward auth headers if present
+    const incomingToken =
+      req.headers.authorization || req.headers["x-api-key"];
 
     const headers = {};
-    if (token) {
-      // Works for Bearer / API Key / Custom
-      headers["Authorization"] = token.startsWith("Bearer")
-        ? token
-        : `Bearer ${token}`;
-      headers["x-api-key"] = token;
+    if (incomingToken) {
+      headers["Authorization"] = incomingToken.startsWith("Bearer")
+        ? incomingToken
+        : `Bearer ${incomingToken}`;
+
+      headers["x-api-key"] = incomingToken;
     }
 
+    // 🌐 Fetch external API
     const response = await axios.get(url, { headers });
 
     return res.json({
+      success: true,
       private: false,
       data: response.data
     });
 
   } catch (err) {
+    // 🔐 Private API protection
     if (err.response && [401, 403].includes(err.response.status)) {
       return res.status(401).json({
+        success: false,
         private: true,
         message: "Private API. Token required"
       });
     }
 
-    return res.status(500).json({ error: "Fetch failed" });
+    console.error("❌ Fetch API Error:", err.message);
+
+    return res.status(500).json({
+      success: false,
+      error: "Fetch failed"
+    });
   }
 });
-
 
 
 // --------------------------------------------------------
@@ -602,36 +736,59 @@ const flattenObject = (obj, prefix = '') =>
 // --------------------------------------------------------
 // 💾 Save API data: Dynamic CSV + Save DB
 // --------------------------------------------------------
-app.post("/save-api-data", (req, res) => {
-  const { api_url, file_name, response, company_name } = req.body;
+// =============================
+// 💾 Save API data (CSV + DB)
+// =============================
+app.post("/save-api-data", authenticateToken, (req, res) => {
+  const { api_url, file_name, response } = req.body;
+
+  // 🔥 From token
+  const uploadedBy = req.user.id;                  // 👈 user_id
+  const company_name = req.user.company_name || null;
 
   if (!response) {
-    return res.status(400).json({ success: false, message: "Response is empty" });
+    return res.status(400).json({
+      success: false,
+      message: "Response is empty",
+    });
   }
 
   let jsonData;
 
   try {
-    jsonData = typeof response === "string" ? JSON.parse(response) : response;
+    jsonData = typeof response === "string"
+      ? JSON.parse(response)
+      : response;
   } catch (err) {
-    return res.status(400).json({ success: false, message: "Invalid JSON" });
+    return res.status(400).json({
+      success: false,
+      message: "Invalid JSON",
+    });
   }
 
-  // Wrap single objects into array for consistent processing
+  // Ensure array
   if (!Array.isArray(jsonData)) {
     jsonData = [jsonData];
   }
 
-  // Handle nested arrays inside each object (e.g., "products" in carts)
+  // -----------------------------
+  // Flatten JSON
+  // -----------------------------
   const flatData = [];
+
   jsonData.forEach(item => {
-    const arrayKeys = Object.keys(item).filter(key => Array.isArray(item[key]));
+    const arrayKeys = Object.keys(item).filter(
+      key => Array.isArray(item[key])
+    );
 
     if (arrayKeys.length) {
-      // Expand each nested array into multiple rows
       arrayKeys.forEach(arrKey => {
         item[arrKey].forEach(subItem => {
-          const row = flattenObject({ ...item, [arrKey]: undefined, ...subItem });
+          const row = flattenObject({
+            ...item,
+            [arrKey]: undefined,
+            ...subItem
+          });
           flatData.push(row);
         });
       });
@@ -640,11 +797,16 @@ app.post("/save-api-data", (req, res) => {
     }
   });
 
-  if (flatData.length === 0) {
-    return res.status(400).json({ success: false, message: "No data to save" });
+  if (!flatData.length) {
+    return res.status(400).json({
+      success: false,
+      message: "No data to save",
+    });
   }
 
-  // Convert JSON → CSV
+  // -----------------------------
+  // JSON → CSV
+  // -----------------------------
   let csv;
   try {
     const fields = Object.keys(flatData[0]);
@@ -652,41 +814,64 @@ app.post("/save-api-data", (req, res) => {
     csv = parser.parse(flatData);
   } catch (err) {
     console.error("CSV Parse Error:", err);
-    return res.status(500).json({ success: false, message: "Failed to convert JSON to CSV" });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to convert JSON to CSV",
+    });
   }
 
-  // Save CSV File
-  const filePath = path.join(uploadDir, file_name + ".csv");
+  // -----------------------------
+  // Save CSV file
+  // -----------------------------
+  const filePath = path.join(uploadDir, `${file_name}.csv`);
+
   try {
     fs.writeFileSync(filePath, csv);
   } catch (err) {
     console.error("File Save Error:", err);
-    return res.status(500).json({ success: false, message: "Failed to save CSV file" });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save CSV file",
+    });
   }
 
-  // Save in database
+  // -----------------------------
+  // Save DB record (IMPORTANT)
+  // -----------------------------
   const sql = `
-    INSERT INTO api_data (api_url, file_name, file_path, response, company_name)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO api_data
+      (api_url, file_name, file_path, response, company_name, uploaded_by)
+    VALUES (?, ?, ?, ?, ?, ?)
   `;
 
   db.query(
     sql,
-    [api_url, file_name, `uploads/API_Files/${file_name}.csv`, JSON.stringify(response), company_name],
-    (err, result) => {
+    [
+      api_url,
+      file_name,
+      `uploads/API_Files/${file_name}.csv`,
+      JSON.stringify(response),
+      company_name,
+      uploadedBy,           // 👈 user_id stored here
+    ],
+    (err) => {
       if (err) {
         console.error("DB Error:", err);
-        return res.json({ success: false, message: "DB Error" });
+        return res.status(500).json({
+          success: false,
+          message: "DB Error",
+        });
       }
 
       res.json({
         success: true,
         message: "API Data saved successfully!",
-        file_path: `uploads/API_Files/${file_name}.csv`
+        file_path: `uploads/API_Files/${file_name}.csv`,
       });
     }
   );
 });
+
 
 // ======================
 // HELPERS
@@ -747,177 +932,182 @@ function safeFileName(name) {
 // /upload ROUTE (CLEAN FINAL VERSION)
 // ======================
 
-app.post(
-  "/upload",
-  authenticateToken,
-  upload.array("files"),
-  async (req, res) => {
-    try {
-      if (!req.files || req.files.length === 0) {
-        return res.status(400).json({
-          success: false,
-          error: "No files uploaded"
-        });
-      }
-
-      const companyName = req.user?.company_name || null;
-      const rawName = req.body.name || "uploaded_file";
-      const baseFileName = safeFileName(rawName);
-
-      // ==================================================
-      // SINGLE FILE FLOW
-      // ==================================================
-      if (req.files.length === 1) {
-        const file = req.files[0];
-        const finalFilename = `${baseFileName}.csv`;
-        const finalPath = path.join(__dirname, "uploads", finalFilename);
-
-        fs.renameSync(file.path, finalPath);
-
-        const [existing] = await db.promise().query(
-          `SELECT id FROM files
-           WHERE file_name = ?
-           AND company_name <=> ?`,
-          [baseFileName, companyName]
-        );
-
-        const status = existing.length > 0 ? "CANCEL" : "NEW";
-
-        await db.promise().query(
-          `INSERT INTO files (file_name, file_path, company_name, status)
-           VALUES (?, ?, ?, ?)`,
-          [
-            baseFileName,
-            `/uploads/${finalFilename}`,
-            companyName,
-            status
-          ]
-        );
-
-        return res.json({
-          success: true,
-          message: "File uploaded successfully",
-          file: finalFilename
-        });
-      }
-
-      // ==================================================
-      // MULTI FILE FLOW (MERGE → ONE FILE)
-      // ==================================================
-      if (req.files.length > 1) {
-        let allHeaders = [];
-        let allDataRaw = [];
-
-        for (const file of req.files) {
-          const { headers, data } = await readCSV(file.path);
-
-          const normalizedHeaders = headers.map(h => sanitizeName(h));
-          allHeaders.push(normalizedHeaders);
-
-          const normalizedData = data.map(row => {
-            const obj = {};
-            Object.keys(row).forEach(k => {
-              obj[sanitizeName(k)] = row[k];
-            });
-            return obj;
-          });
-
-          allDataRaw.push(normalizedData);
-        }
-
-        const commonColumns = allHeaders.reduce((a, b) =>
-          a.filter(c => b.includes(c))
-        );
-
-        if (commonColumns.length === 0) {
-          return res.status(400).json({
-            success: false,
-            error: "No common primary key found"
-          });
-        }
-
-        const primaryKey =
-          commonColumns.includes("id") ? "id" :
-          commonColumns.includes("user_id") ? "user_id" :
-          commonColumns.includes("emp_id") ? "emp_id" :
-          commonColumns[0];
-
-        const allColumnsSet = new Set();
-        allHeaders.forEach(h => h.forEach(c => allColumnsSet.add(c)));
-        let allColumns = Array.from(allColumnsSet);
-
-        const map = new Map();
-        for (const fileData of allDataRaw) {
-          for (const row of fileData) {
-            if (!row[primaryKey]) continue;
-
-            const key = row[primaryKey].toString().trim();
-            if (!map.has(key)) {
-              const obj = {};
-              allColumns.forEach(c => (obj[c] = ""));
-              map.set(key, obj);
-            }
-
-            const target = map.get(key);
-            Object.keys(row).forEach(col => {
-              if (row[col] !== "") target[col] = row[col];
-            });
-          }
-        }
-
-        allColumns = [
-          primaryKey,
-          ...allColumns.filter(c => c !== primaryKey)
-        ];
-
-        const parser = new Parser({ fields: allColumns });
-        const mergedCSV = parser.parse(Array.from(map.values()));
-
-        // 🔥 USE USER FILE NAME
-        let finalFilename = `${baseFileName}.csv`;
-        let finalPath = path.join(__dirname, "uploads", finalFilename);
-
-        // avoid overwrite
-        let counter = 1;
-        while (fs.existsSync(finalPath)) {
-          finalFilename = `${baseFileName}_${counter}.csv`;
-          finalPath = path.join(__dirname, "uploads", finalFilename);
-          counter++;
-        }
-
-        fs.writeFileSync(finalPath, mergedCSV);
-
-        // delete temp uploads
-        req.files.forEach(f => {
-          if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
-        });
-
-        // save ONLY merged file
-        await db.promise().query(
-          `INSERT INTO files (file_name, file_path, company_name, status)
-           VALUES (?, ?, ?, 'NEW')`,
-          [
-            baseFileName,
-            `/uploads/${finalFilename}`,
-            companyName
-          ]
-        );
-
-        return res.json({
-          success: true,
-          message: "Files merged successfully",
-          file: finalFilename
-        });
-      }
-
-    } catch (err) {
-      console.error("❌ UPLOAD ERROR:", err);
-      return res.status(500).json({
+app.post("/upload", authenticateToken, (req, res, next) => {
+  if (req.user.viewOnly) {
+    return res.status(403).json({ error: "View-only users cannot upload files" });
+  }
+  next();
+}, upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
         success: false,
-        error: err.message
+        error: "No files uploaded"
       });
     }
+
+    const companyName = req.user?.company_name || null;
+    const rawName = req.body.name || "uploaded_file";
+    const baseFileName = safeFileName(rawName);
+
+    // ==================================================
+    // SINGLE FILE FLOW
+    // ==================================================
+    if (req.files.length === 1) {
+      const file = req.files[0];
+      const finalFilename = `${baseFileName}.csv`;
+      const finalPath = path.join(__dirname, "uploads", finalFilename);
+
+      fs.renameSync(file.path, finalPath);
+
+      const [existing] = await db.promise().query(
+        `SELECT id FROM files
+           WHERE file_name = ?
+           AND company_name <=> ?`,
+        [baseFileName, companyName]
+      );
+
+      const status = existing.length > 0 ? "CANCEL" : "NEW";
+
+      await db.promise().query(
+        `INSERT INTO files (file_name, file_path, company_name, uploaded_by, status)
+   VALUES (?, ?, ?, ?, ?)`,
+        [
+          baseFileName,
+          `/uploads/${finalFilename}`,
+          companyName,
+          req.user.id,     // 👈 user_id
+          status
+        ]
+      );
+
+
+      return res.json({
+        success: true,
+        message: "File uploaded successfully",
+        file: finalFilename
+      });
+    }
+
+    // ==================================================
+    // MULTI FILE FLOW (MERGE → ONE FILE)
+    // ==================================================
+    if (req.files.length > 1) {
+      let allHeaders = [];
+      let allDataRaw = [];
+
+      for (const file of req.files) {
+        const { headers, data } = await readCSV(file.path);
+
+        const normalizedHeaders = headers.map(h => sanitizeName(h));
+        allHeaders.push(normalizedHeaders);
+
+        const normalizedData = data.map(row => {
+          const obj = {};
+          Object.keys(row).forEach(k => {
+            obj[sanitizeName(k)] = row[k];
+          });
+          return obj;
+        });
+
+        allDataRaw.push(normalizedData);
+      }
+
+      const commonColumns = allHeaders.reduce((a, b) =>
+        a.filter(c => b.includes(c))
+      );
+
+      if (commonColumns.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "No common primary key found"
+        });
+      }
+
+      const primaryKey =
+        commonColumns.includes("id") ? "id" :
+          commonColumns.includes("user_id") ? "user_id" :
+            commonColumns.includes("emp_id") ? "emp_id" :
+              commonColumns[0];
+
+      const allColumnsSet = new Set();
+      allHeaders.forEach(h => h.forEach(c => allColumnsSet.add(c)));
+      let allColumns = Array.from(allColumnsSet);
+
+      const map = new Map();
+      for (const fileData of allDataRaw) {
+        for (const row of fileData) {
+          if (!row[primaryKey]) continue;
+
+          const key = row[primaryKey].toString().trim();
+          if (!map.has(key)) {
+            const obj = {};
+            allColumns.forEach(c => (obj[c] = ""));
+            map.set(key, obj);
+          }
+
+          const target = map.get(key);
+          Object.keys(row).forEach(col => {
+            if (row[col] !== "") target[col] = row[col];
+          });
+        }
+      }
+
+      allColumns = [
+        primaryKey,
+        ...allColumns.filter(c => c !== primaryKey)
+      ];
+
+      const parser = new Parser({ fields: allColumns });
+      const mergedCSV = parser.parse(Array.from(map.values()));
+
+      // 🔥 USE USER FILE NAME
+      let finalFilename = `${baseFileName}.csv`;
+      let finalPath = path.join(__dirname, "uploads", finalFilename);
+
+      // avoid overwrite
+      let counter = 1;
+      while (fs.existsSync(finalPath)) {
+        finalFilename = `${baseFileName}_${counter}.csv`;
+        finalPath = path.join(__dirname, "uploads", finalFilename);
+        counter++;
+      }
+
+      fs.writeFileSync(finalPath, mergedCSV);
+
+      // delete temp uploads
+      req.files.forEach(f => {
+        if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
+      });
+
+      // save ONLY merged file
+      await db.promise().query(
+        `INSERT INTO files (file_name, file_path, company_name, uploaded_by, status)
+   VALUES (?, ?, ?, ?, 'NEW')`,
+        [
+          baseFileName,
+          `/uploads/${finalFilename}`,
+          companyName,
+          req.user.id
+        ]
+      );
+
+
+      return res.json({
+        success: true,
+        message: "Files merged successfully",
+        file: finalFilename
+      });
+    }
+
+  } catch (err) {
+    console.error("❌ UPLOAD ERROR:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
+}
 );
 
 /// =============================
@@ -928,7 +1118,7 @@ app.get("/files", authenticateToken, async (req, res) => {
     const company = req.user.company_name || null;
 
     // =============================
-    // 1️⃣ UPLOADED FILES
+    // 1️⃣ UPLOADED FILES (FIXED)
     // =============================
     const uploadedQuery = company
       ? `SELECT 
@@ -939,7 +1129,7 @@ app.get("/files", authenticateToken, async (req, res) => {
            status,
            is_primary
          FROM files
-         WHERE company_name = ? OR company_name IS NULL
+         WHERE company_name = ?
          ORDER BY id ASC`
       : `SELECT 
            id,
@@ -968,10 +1158,19 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 2️⃣ API FILES
+    // 2️⃣ API FILES (FIXED)
     // =============================
+    const apiQuery = company
+      ? `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name = ?`
+      : `SELECT id, file_name AS name, file_path AS path
+         FROM api_data
+         WHERE company_name IS NULL`;
+
     const [apiFiles] = await db.promise().query(
-      `SELECT id, file_name AS name, file_path AS path FROM api_data`
+      apiQuery,
+      company ? [company] : []
     );
 
     const apiFilesWithSource = apiFiles.map(f => ({
@@ -985,8 +1184,21 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 3️⃣ PROCESSED TABLES
+    // 3️⃣ PROCESSED TABLES (AUTO-FIXED)
     // =============================
+    const allowedFilesQuery = company
+      ? `SELECT file_name FROM files WHERE company_name = ?`
+      : `SELECT file_name FROM files WHERE company_name IS NULL`;
+
+    const [allowedFiles] = await db.promise().query(
+      allowedFilesQuery,
+      company ? [company] : []
+    );
+
+    const allowedBaseNames = new Set(
+      allowedFiles.map(f => f.file_name.toLowerCase())
+    );
+
     const [tables] = await db.promise().query(`SHOW TABLES`);
 
     const processedMap = {};
@@ -994,20 +1206,17 @@ app.get("/files", authenticateToken, async (req, res) => {
     tables.forEach(row => {
       const tableName = Object.values(row)[0].toLowerCase();
 
-      if (
-        tableName.endsWith("_fulltable") ||
-        tableName.endsWith("_entity") ||
-        tableName.endsWith("_metrics") ||
-        tableName.endsWith("_dimension")
-      ) {
-        const baseName = tableName.replace(
-          /_(fulltable|entity|metrics|dimension)$/,
-          ""
-        );
+      const match = tableName.match(
+        /(.+)_(fulltable|entity|metrics|dimension)$/
+      );
 
-        if (!processedMap[baseName]) processedMap[baseName] = [];
-        processedMap[baseName].push(tableName);
-      }
+      if (!match) return;
+
+      const baseName = match[1];
+      if (!allowedBaseNames.has(baseName)) return;
+
+      if (!processedMap[baseName]) processedMap[baseName] = [];
+      processedMap[baseName].push(tableName);
     });
 
     const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
@@ -1019,49 +1228,27 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 4️⃣ STATUS FIX (UPDATED)
+    // 4️⃣ STATUS FIX (UNCHANGED)
     // =============================
     const processedSet = new Set(
       processedFolders.map(p => p.folderName.toLowerCase())
     );
 
     const getBaseName = (name = "") =>
-      name
-        .toLowerCase()
-        .replace(/\.[^/.]+$/, "")
-        .replace(/_v\d+$/, "");
+      name.toLowerCase().replace(/\.[^/.]+$/, "");
 
     const allFiles = [
       ...uploadedFilesWithSource,
       ...apiFilesWithSource
     ].map(f => {
-      let baseName;
-
-      if (f.path === "MULTI_UPLOAD" && f.table_name) {
-        baseName = f.table_name.toLowerCase();
-      } else {
-        baseName = getBaseName(f.name);
-      }
+      const baseName = getBaseName(f.name);
 
       let finalStatus;
+      if (f.status === "CANCEL") finalStatus = "CANCEL";
+      else if (processedSet.has(baseName)) finalStatus = "DONE";
+      else finalStatus = "NEW";
 
-      if (f.status === "CANCEL") {
-        finalStatus = "CANCEL";
-      }
-      else if (processedSet.has(baseName)) {
-        finalStatus = "DONE";
-      }
-      else if (!f.status || f.status === "NEW") {
-        finalStatus = "NEW";   // 👈 batch start aagala
-      }
-      else {
-        finalStatus = "PROCESSING";
-      }
-
-      return {
-        ...f,
-        status: finalStatus
-      };
+      return { ...f, status: finalStatus };
     });
 
     // =============================
@@ -1103,6 +1290,112 @@ app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
     });
   }
 });
+
+app.get("/dashboard-counts", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const company = req.user.company_name || null;
+
+    // =============================
+    // 1️⃣ MY UPLOADED FILES
+    // =============================
+    const [[myFiles]] = await promiseDb.query(
+      `SELECT COUNT(*) AS count FROM files WHERE uploaded_by = ?`,
+      [userId]
+    );
+
+    // =============================
+    // 2️⃣ MY API FILES
+    // =============================
+    const [[myApi]] = await promiseDb.query(
+      `SELECT COUNT(*) AS count FROM api_data WHERE uploaded_by = ?`,
+      [userId]
+    );
+
+    // =============================
+    // 3️⃣ GET ALL PROCESSED TABLE BASE NAMES
+    // =============================
+    const [tables] = await promiseDb.query("SHOW TABLES");
+
+    const processedSet = new Set(
+      tables
+        .map(t => Object.values(t)[0])
+        .filter(name =>
+          name.endsWith("_fulltable") ||
+          name.endsWith("_entity") ||
+          name.endsWith("_metrics") ||
+          name.endsWith("_dimension")
+        )
+        .map(name =>
+          name.replace(/_(fulltable|entity|metrics|dimension)$/i, "")
+            .toLowerCase()
+        )
+    );
+
+    // =============================
+    // 4️⃣ MY PROCESSED FILES
+    // =============================
+    const [myNames] = await promiseDb.query(
+      `SELECT file_name FROM files WHERE uploaded_by = ?`,
+      [userId]
+    );
+
+    const myProcessed = myNames.filter(f =>
+      processedSet.has(f.file_name.toLowerCase())
+    ).length;
+
+    // =============================
+    // 5️⃣ COMPANY STATS
+    // =============================
+    let companyStats = null;
+
+    if (company) {
+      const [[companyFiles]] = await promiseDb.query(
+        `SELECT COUNT(*) AS count FROM files WHERE company_name = ?`,
+        [company]
+      );
+
+      const [[companyApi]] = await promiseDb.query(
+        `SELECT COUNT(*) AS count FROM api_data WHERE company_name = ?`,
+        [company]
+      );
+
+      // 🔥 COMPANY PROCESSED FILES
+      const [companyNames] = await promiseDb.query(
+        `SELECT file_name FROM files WHERE company_name = ?`,
+        [company]
+      );
+
+      const companyProcessed = companyNames.filter(f =>
+        processedSet.has(f.file_name.toLowerCase())
+      ).length;
+
+      companyStats = {
+        uploadedFiles: companyFiles.count,
+        uploadedApi: companyApi.count,
+        processedFiles: companyProcessed   // ✅ ADDED
+      };
+    }
+
+    // =============================
+    // 6️⃣ RESPONSE
+    // =============================
+    res.json({
+      success: true,
+      me: {
+        uploadedFiles: myFiles.count,
+        uploadedApi: myApi.count,
+        processedFiles: myProcessed
+      },
+      company: companyStats
+    });
+
+  } catch (err) {
+    console.error("❌ Dashboard Counts Error:", err);
+    res.status(500).json({ error: "Dashboard failed" });
+  }
+});
+
 
 
 // =============================
@@ -1300,15 +1593,6 @@ app.put('/change-mobile', async (req, res) => {
 });
 
 
-
-// Initialize once
-const cohere = new CohereClient({
-  token: process.env.COHERE_API_KEY
-});
-
-// ------------------------
-// NLQ SEARCH ROUTE (COHERE - FREE)
-// ------------------------
 app.post("/nlq-search", async (req, res) => {
   try {
     const { question, tableName } = req.body;
@@ -1317,44 +1601,64 @@ app.post("/nlq-search", async (req, res) => {
       return res.status(400).json({ error: "Missing input" });
     }
 
-    // Fetch sample rows
     const [rows] = await promiseDb.query(
-      `SELECT * FROM \`${tableName}\` LIMIT 20`
+      `SELECT * FROM \`${tableName}\` LIMIT 30`
     );
 
     if (!rows.length) {
       return res.status(404).json({ error: "Table is empty" });
     }
 
+    // Convert table rows → readable text
+    const tableText = rows
+      .map((row, i) =>
+        `${i + 1}. ${Object.entries(row)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join(", ")}`
+      )
+      .join("\n");
+
     const prompt = `
-Answer the question using the table data.
+You are a data analyst.
+Answer ONLY using the table data.
+If the answer is not present, say "Not available".
+Give a short, clear answer.
 
 Question:
 ${question}
 
 Table Data:
-${JSON.stringify(rows)}
-
-Give a short answer.
+${tableText}
 `;
 
-    const response = await cohere.generate({
-      model: "command-light", // free-tier model
-      prompt,
-      maxTokens: 150,
-      temperature: 0.3,
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini", // ✅ best for NLQ
+      messages: [
+        { role: "system", content: "You answer questions from tabular data." },
+        { role: "user", content: prompt },
+      ],
+      temperature: 0.2,
     });
+
+    const answer =
+      completion.choices?.[0]?.message?.content ||
+      "No answer generated";
 
     res.json([
       {
-        result: response.generations[0].text.trim(),
+        result: answer.trim(),
       },
     ]);
+
   } catch (err) {
-    console.error("❌ Cohere NLQ Error:", err);
-    res.status(500).json({ error: "NLQ failed" });
+    console.error("❌ OpenAI NLQ Error:", err);
+    res.status(500).json({
+      error: "NLQ failed",
+      message: err.message,
+    });
   }
 });
+
 
 // =============================
 // START SERVER
