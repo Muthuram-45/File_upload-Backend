@@ -235,92 +235,204 @@ app.post('/verify-otp', (req, res) => {
   res.json({ success: true, message: '✅ OTP verified successfully' });
 });
 
+// gmail detect
+
+// gmail detect
+
+function detectRoleAndCompany(email) {
+  const [prefix, domain] = email.toLowerCase().split("@");
+
+  if (["gmail.com", "yahoo.com", "outlook.com"].includes(domain)) {
+    return {
+      role: "personal",
+      company_name: null
+    };
+  }
+
+  const companyName = domain.split(".")[0];
+
+  if (prefix === "manager" || prefix === "admin") {
+    return {
+      role: "manager",
+      company_name: companyName
+    };
+  }
+
+  return {
+    role: "employee",
+    company_name: companyName
+  };
+}
+
+
+
 // =============================
 // REGISTER USER
 // =============================
 app.post('/register', async (req, res) => {
   try {
-    const { firstName, lastName, email, mobile, password, company_name } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ success: false, error: 'Email and password required' });
+    const { firstName, lastName, email, mobile, password } = req.body;
 
-    const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
-    if (existing.length > 0)
-      return res.status(400).json({ success: false, error: 'User already registered' });
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'Email and password required' });
+    }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    await db
+    // 🔍 Check existing user
+    const [existing] = await db
       .promise()
-      .query(
-        'INSERT INTO users (first_name, last_name, email, mobile, password, company_name) VALUES (?, ?, ?, ?, ?, ?)',
-        [firstName, lastName, email, mobile || '', hashedPassword, company_name || null]
-      );
+      .query('SELECT id FROM users WHERE email = ?', [email]);
 
-    res.json({ success: true, message: '✅ User registered successfully' });
+    if (existing.length > 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'User already registered' });
+    }
+
+    // 🔐 Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 🔥 AUTO DETECT ROLE + COMPANY
+    const role = "personal";      // ✅ always personal
+    const company_name = null;   // ✅ no company
+
+
+    // 💾 Insert user
+    await db.promise().query(
+      `INSERT INTO users
+   (first_name, last_name, email, mobile, password, company_name, role)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        firstName,
+        lastName,
+        email,
+        mobile || '',
+        hashedPassword,
+        company_name,
+        role
+      ]
+    );
+
+
+    res.json({
+      success: true,
+      message: '✅ User registered successfully',
+      role,
+      company_name
+    });
   } catch (err) {
     console.error('❌ Register Error:', err);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error'
+    });
   }
 });
+
 
 app.post('/company-register', async (req, res) => {
   try {
     const { firstName, lastName, email, mobile, password, company_name } = req.body;
-    if (!email || !password || !company_name)
-      return res.status(400).json({ success: false, error: 'All fields required' });
 
-    const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
-    if (existing.length > 0)
-      return res.status(400).json({ success: false, error: 'Company already registered' });
+    if (!email || !password || !company_name) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'All fields required' });
+    }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
-    await db
+    // 🔍 Check if email already exists
+    const [existing] = await db
       .promise()
-      .query(
-        'INSERT INTO users (first_name, last_name, email, mobile, password, company_name) VALUES (?, ?, ?, ?, ?, ?)',
-        [firstName, lastName, email, mobile || '', hashedPassword, company_name]
-      );
+      .query('SELECT id FROM users WHERE email = ?', [email]);
 
-    res.json({ success: true, message: '✅ Company registered successfully' });
+    if (existing.length > 0) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'Company already registered' });
+    }
+
+    // 🔐 Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // 💾 Insert company manager
+    await db.promise().query(
+      `INSERT INTO users
+       (first_name, last_name, email, mobile, password, company_name, role)
+       VALUES (?, ?, ?, ?, ?, ?, 'manager')`,
+      [
+        firstName,
+        lastName,
+        email,
+        mobile || '',
+        hashedPassword,
+        company_name
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: '✅ Company registered successfully',
+      role: 'manager',
+      company_name
+    });
   } catch (err) {
     console.error('❌ Company Register Error:', err);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error'
+    });
   }
 });
-// =============================
-// NORMAL LOGIN (NO COMPANY)
-// =============================
+
 app.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body
-    if (!email || !password)
-      return res.status(400).json({ success: false, error: 'Email and password required' });
+    const { email, password } = req.body;
 
-    const [rows] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
-    if (rows.length === 0)
-      return res.status(400).json({ success: false, error: 'Invalid credentials' });
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password required'
+      });
+    }
+
+    const [rows] = await db
+      .promise()
+      .query('SELECT * FROM users WHERE email = ?', [email]);
+
+    if (rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
 
     const user = rows[0];
+
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch)
-      return res.status(400).json({ success: false, error: 'Invalid credentials' });
+    if (!isMatch) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
 
     const now = new Date();
+    await db
+      .promise()
+      .query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
 
-    // ✅ UPDATE LAST LOGIN
-    await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
-
-
-      const token = jwt.sign(
+    // 🔥 JWT WITH ROLE
+    const token = jwt.sign(
       {
-        id: user.id,                  // 👈 ADD THIS
+        id: user.id,
         email: user.email,
+        role: user.role,                         // ✅ ADD
         company_name: user.company_name || null
       },
       secret_key,
       { expiresIn: '24h' }
     );
-
 
     res.json({
       success: true,
@@ -332,50 +444,80 @@ app.post('/login', async (req, res) => {
         lastName: user.last_name,
         email: user.email,
         mobile: user.mobile,
-        lastLogin: now,
-      },
+        role: user.role,                         // ✅ FRONTEND USE
+        company_name: user.company_name || null,
+        lastLogin: now
+      }
     });
   } catch (err) {
     console.error('❌ Login Error:', err);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error'
+    });
   }
 });
-
-// =============================
-// COMPANY LOGIN
-// =============================
 app.post('/company-login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ success: false, error: 'Email and password required' });
 
-    const [rows] = await db
-      .promise()
-      .query(
-        'SELECT id, first_name, last_name, email, password, company_name, mobile FROM users WHERE email = ?',
-        [email]
-      );
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password required'
+      });
+    }
 
-    if (rows.length === 0)
-      return res.status(400).json({ success: false, error: 'Invalid credentials' });
+    const [rows] = await db.promise().query(
+      `SELECT id, first_name, last_name, email, password,
+              company_name, mobile, role
+       FROM users
+       WHERE email = ?`,
+      [email]
+    );
+
+    if (rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid credentials'
+      });
+    }
 
     const user = rows[0];
+
+    // 🚫 BLOCK PERSONAL USERS
+    if (user.role === 'personal') {
+      return res.status(403).json({
+        success: false,
+        error: 'Personal users cannot use company login'
+      });
+    }
+
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch)
-      return res.status(400).json({ success: false, error: 'Invalid password' });
+    if (!isMatch) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid password'
+      });
+    }
 
     const now = new Date();
+    await db
+      .promise()
+      .query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
 
-    // ✅ UPDATE LAST LOGIN
-    await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
-
+    // 🔥 JWT WITH ROLE
     const token = jwt.sign(
-      { id: user.id, email: user.email, company_name: user.company_name || null, mobile: user.mobile },
+      {
+        id: user.id,
+        email: user.email,
+        role: user.role,                       // ✅ ADD
+        company_name: user.company_name,
+        mobile: user.mobile
+      },
       secret_key,
       { expiresIn: '24h' }
     );
-
 
     res.json({
       success: true,
@@ -386,14 +528,18 @@ app.post('/company-login', async (req, res) => {
         firstName: user.first_name,
         lastName: user.last_name,
         email: user.email,
+        role: user.role,
         company_name: user.company_name,
         mobile: user.mobile,
-        lastLogin: now,
-      },
+        lastLogin: now
+      }
     });
   } catch (err) {
     console.error('❌ Company Login Error:', err);
-    res.status(500).json({ success: false, error: 'Internal Server Error' });
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error'
+    });
   }
 });
 
@@ -403,13 +549,23 @@ app.post("/invite-employee", authenticateToken, async (req, res) => {
     const { email, accessType } = req.body;
     const inviter = req.user;
 
-    if (!inviter.company_name) {
+    // 🔒 1️⃣ ONLY MANAGER CAN INVITE
+    if (inviter.role !== "manager") {
       return res.status(403).json({
         success: false,
-        error: "Only company users can invite employees",
+        error: "Only manager can invite employees",
       });
     }
 
+    // 🔒 2️⃣ COMPANY MUST EXIST
+    if (!inviter.company_name) {
+      return res.status(400).json({
+        success: false,
+        error: "Manager must belong to a company",
+      });
+    }
+
+    // 🔒 3️⃣ SAME DOMAIN CHECK
     const inviterDomain = inviter.email.split("@")[1];
     const inviteeDomain = email.split("@")[1];
 
@@ -420,55 +576,63 @@ app.post("/invite-employee", authenticateToken, async (req, res) => {
       });
     }
 
+    // 🔐 4️⃣ CREATE INVITE TOKEN
     const inviteToken = jwt.sign(
       {
         email,
         company_name: inviter.company_name,
-        accessType, // "login" or "view"
+        accessType,        // "login" | "view"
       },
       secret_key,
       { expiresIn: "48h" }
     );
 
-    // 🔥 ALWAYS go via invite-redirect
+    // 🔗 5️⃣ INVITE LINK
     const inviteLink = `http://localhost:5173/invite-redirect?token=${inviteToken}`;
 
+    // 📧 6️⃣ SEND EMAIL
     await transporter.sendMail({
       from: "Cloud360 <muthuram921@gmail.com>",
       to: email,
       subject: "Cloud360 Employee Invitation",
       html: `
-        <p>You are invited to Cloud360.</p>
+        <p>You are invited to <b>${inviter.company_name}</b>.</p>
         <p>Access type: <b>${accessType.toUpperCase()}</b></p>
         <a href="${inviteLink}">Click here to continue</a>
       `,
     });
 
-    res.json({ success: true, message: "Invite sent successfully" });
+    res.json({
+      success: true,
+      message: "✅ Invite sent successfully",
+    });
   } catch (err) {
-    console.error("Invite Error:", err);
-    res.status(500).json({ success: false, error: "Invite failed" });
+    console.error("❌ Invite Error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Invite failed",
+    });
   }
 });
 
 
+
+// =============================
+// VERIFY INVITE
+// =============================
 app.get("/verify-invite", (req, res) => {
   try {
     const { token } = req.query;
-
-    if (!token) {
-      return res.status(400).json({ success: false });
-    }
-
     const decoded = jwt.verify(token, secret_key);
 
-    // 👀 VIEW ACCESS
+    // 🔵 VIEW ACCESS
     if (decoded.accessType === "view") {
       const viewToken = jwt.sign(
         {
           email: decoded.email,
           company_name: decoded.company_name,
-          viewOnly: true,
+          role: "employee",
+          viewOnly: true
         },
         secret_key,
         { expiresIn: "6h" }
@@ -477,70 +641,95 @@ app.get("/verify-invite", (req, res) => {
       return res.json({
         success: true,
         access: "view",
-        email: decoded.email,
-        company_name: decoded.company_name,
-        viewToken,
+        token: viewToken
       });
     }
 
-    // 🔑 LOGIN ACCESS
+    // 🔵 LOGIN ACCESS → FORCE COMPANY REGISTER
     return res.json({
       success: true,
       access: "login",
       email: decoded.email,
       company_name: decoded.company_name,
+      forceCompanyRegister: true   // 🔥 IMPORTANT
     });
 
   } catch (err) {
-    console.error("Verify invite error:", err.message);
     return res.status(400).json({ success: false });
   }
 });
 
 
-
-
-// =============================
-// GOOGLE LOGIN
-// =============================
 app.post('/google-login', async (req, res) => {
   try {
     const { token } = req.body;
-    if (!token)
-      return res.status(400).json({ success: false, error: 'Token required' });
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        error: 'Token required'
+      });
+    }
 
     const decoded = await admin.auth().verifyIdToken(token);
+
     const email = decoded.email;
     const fullName = decoded.name || '';
     const [firstName, lastName = ''] = fullName.split(' ');
     const picture = decoded.picture || '';
 
-    console.log(`🧾 Google Sign-In Request Received for: ${email}`);
+    console.log(`🧾 Google Sign-In Request: ${email}`);
 
-    const [existing] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+    const [existing] = await db
+      .promise()
+      .query('SELECT * FROM users WHERE email = ?', [email]);
 
     let user;
+
     if (existing.length === 0) {
-      console.log(`🆕 New Google user detected: ${email}. Creating account...`);
-      await db
+      // 🔥 AUTO DETECT ROLE + COMPANY
+      const role = "personal";      // ✅ Google login = personal
+      const company_name = null;
+
+
+      await db.promise().query(
+        `INSERT INTO users
+         (first_name, last_name, email, mobile, password,
+          company_name, role, last_login)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          firstName,
+          lastName,
+          email,
+          '',
+          '',
+          company_name,
+          role,
+          new Date()
+        ]
+      );
+
+      const [newUser] = await db
         .promise()
-        .query(
-          'INSERT INTO users (first_name, last_name, email, mobile, password, last_login) VALUES (?, ?, ?, ?, ?, ?)',
-          [firstName, lastName, email, '', '', new Date()]
-        );
-      const [newUser] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+        .query('SELECT * FROM users WHERE email = ?', [email]);
+
       user = newUser[0];
     } else {
       user = existing[0];
-      console.log(`✅ Existing Google user found: ${email}`);
-      // ✅ UPDATE LAST LOGIN
-      await db.promise().query('UPDATE users SET last_login = ? WHERE id = ?', [new Date(), user.id]);
+      await db
+        .promise()
+        .query('UPDATE users SET last_login = ? WHERE id = ?', [
+          new Date(),
+          user.id
+        ]);
     }
 
+    // 🔥 JWT WITH ROLE
     const appToken = jwt.sign(
       {
-        id: user.id,                  // 👈 ADD THIS
+        id: user.id,
         email: user.email,
+        role: user.role,                      // ✅ ADD
         company_name: user.company_name || null
       },
       secret_key,
@@ -556,42 +745,44 @@ app.post('/google-login', async (req, res) => {
         firstName: user.first_name,
         lastName: user.last_name,
         email: user.email,
+        role: user.role,
+        company_name: user.company_name || null,
         picture,
-        lastLogin: new Date(),
-      },
+        lastLogin: new Date()
+      }
     });
   } catch (err) {
     console.error('❌ Google Login Error:', err);
-    res.status(400).json({ success: false, error: 'Invalid or expired Firebase token' });
+    res.status(400).json({
+      success: false,
+      error: 'Invalid or expired Firebase token'
+    });
   }
 });
 
 // =============================
 // FETCH USER PROFILE (Latest from DB)
-// =============================
 app.get('/user/:email', async (req, res) => {
   try {
     const { email } = req.params;
-    if (!email)
-      return res.status(400).json({ success: false, error: 'Email required' });
 
-    const [rows] = await db
-      .promise()
-      .query(
-        `SELECT 
-          first_name AS firstName, 
-          last_name AS lastName, 
-          email, 
-          mobile, 
-          company_name AS company_name,
-          last_login AS lastLogin
-        FROM users 
-        WHERE email = ?`,
-        [email]
-      );
+    const [rows] = await db.promise().query(
+      `SELECT 
+        first_name AS firstName, 
+        last_name AS lastName, 
+        email, 
+        mobile, 
+        role,
+        company_name AS company_name,
+        last_login AS lastLogin
+      FROM users 
+      WHERE email = ?`,
+      [email]
+    );
 
-    if (rows.length === 0)
+    if (rows.length === 0) {
       return res.status(404).json({ success: false, error: 'User not found' });
+    }
 
     res.json({ success: true, user: rows[0] });
   } catch (err) {
@@ -600,8 +791,9 @@ app.get('/user/:email', async (req, res) => {
   }
 });
 
+
 // =============================
-// AUTH MIDDLEWARE
+// AUTH MIDDLEWARE (UPDATED)
 // =============================
 function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -617,20 +809,19 @@ function authenticateToken(req, res, next) {
       return res.status(403).json({ error: "Invalid token" });
     }
 
-    // ✅ SUPPORTS:
-    // - public user
-    // - company user
-    // - invited view-only user
+    // ✅ FINAL USER CONTEXT
     req.user = {
-      id: decoded.id,                         // 👈 REQUIRED (user_id)
+      id: decoded.id,                         // user id
       email: decoded.email,
+      role: decoded.role || "personal",       // 🔥 ADD (VERY IMPORTANT)
       company_name: decoded.company_name || null,
-      viewOnly: decoded.viewOnly || false,
+      viewOnly: decoded.viewOnly || false
     };
 
     next();
   });
 }
+
 
 
 
@@ -723,7 +914,6 @@ const flattenObject = (obj, prefix = '') =>
   Object.keys(obj).reduce((acc, k) => {
     const pre = prefix.length ? prefix + '_' : '';
     if (Array.isArray(obj[k])) {
-      // Arrays are converted to JSON string
       acc[pre + k] = JSON.stringify(obj[k]);
     } else if (typeof obj[k] === 'object' && obj[k] !== null) {
       Object.assign(acc, flattenObject(obj[k], pre + k));
@@ -734,16 +924,19 @@ const flattenObject = (obj, prefix = '') =>
   }, {});
 
 // --------------------------------------------------------
-// 💾 Save API data: Dynamic CSV + Save DB
-// --------------------------------------------------------
-// =============================
 // 💾 Save API data (CSV + DB)
-// =============================
+// --------------------------------------------------------
 app.post("/save-api-data", authenticateToken, (req, res) => {
+  if (req.user.viewOnly) {
+    return res.status(403).json({
+      success: false,
+      error: "View-only users cannot save API data"
+    });
+  }
   const { api_url, file_name, response } = req.body;
 
   // 🔥 From token
-  const uploadedBy = req.user.id;                  // 👈 user_id
+  const uploadedBy = req.user.id;
   const company_name = req.user.company_name || null;
 
   if (!response) {
@@ -754,19 +947,17 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
   }
 
   let jsonData;
-
   try {
     jsonData = typeof response === "string"
       ? JSON.parse(response)
       : response;
-  } catch (err) {
+  } catch {
     return res.status(400).json({
       success: false,
       message: "Invalid JSON",
     });
   }
 
-  // Ensure array
   if (!Array.isArray(jsonData)) {
     jsonData = [jsonData];
   }
@@ -784,12 +975,13 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
     if (arrayKeys.length) {
       arrayKeys.forEach(arrKey => {
         item[arrKey].forEach(subItem => {
-          const row = flattenObject({
-            ...item,
-            [arrKey]: undefined,
-            ...subItem
-          });
-          flatData.push(row);
+          flatData.push(
+            flattenObject({
+              ...item,
+              [arrKey]: undefined,
+              ...subItem
+            })
+          );
         });
       });
     } else {
@@ -821,12 +1013,22 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
   }
 
   // -----------------------------
+  // ✅ SAFE FILE NAME (NEW)
+  // -----------------------------
+  const safeName = file_name
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/g, "");
+
+  const relativePath = `uploads/API_Files/${safeName}.csv`;
+  const fullPath = path.join(__dirname, relativePath);
+
+  // -----------------------------
   // Save CSV file
   // -----------------------------
-  const filePath = path.join(uploadDir, `${file_name}.csv`);
-
   try {
-    fs.writeFileSync(filePath, csv);
+    fs.writeFileSync(fullPath, csv);
   } catch (err) {
     console.error("File Save Error:", err);
     return res.status(500).json({
@@ -836,7 +1038,7 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
   }
 
   // -----------------------------
-  // Save DB record (IMPORTANT)
+  // Save DB record (FIXED)
   // -----------------------------
   const sql = `
     INSERT INTO api_data
@@ -848,11 +1050,11 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
     sql,
     [
       api_url,
-      file_name,
-      `uploads/API_Files/${file_name}.csv`,
-      JSON.stringify(response),
+      safeName,
+      relativePath,
+      JSON.stringify(jsonData), // ✅ FIXED
       company_name,
-      uploadedBy,           // 👈 user_id stored here
+      uploadedBy,
     ],
     (err) => {
       if (err) {
@@ -866,11 +1068,12 @@ app.post("/save-api-data", authenticateToken, (req, res) => {
       res.json({
         success: true,
         message: "API Data saved successfully!",
-        file_path: `uploads/API_Files/${file_name}.csv`,
+        file_path: relativePath,
       });
     }
   );
 });
+
 
 
 // ======================
@@ -1110,41 +1313,58 @@ app.post("/upload", authenticateToken, (req, res, next) => {
 }
 );
 
-/// =============================
-// GET FILES (Uploaded + API + Processed)
+// =============================
+// GET FILES (ROLE BASED - FINAL)
 // =============================
 app.get("/files", authenticateToken, async (req, res) => {
   try {
-    const company = req.user.company_name || null;
+    const { role, company_name, id: userId } = req.user;
+
+    // 🔥 SCOPE DECISION
+    const isManager = role === "manager";
+    const isCompanyUser = !!company_name;
 
     // =============================
-    // 1️⃣ UPLOADED FILES (FIXED)
+    // 1️⃣ UPLOADED FILES
     // =============================
-    const uploadedQuery = company
-      ? `SELECT 
-           id,
-           file_name AS name,
-           file_path AS path,
-           table_name,
-           status,
-           is_primary
-         FROM files
-         WHERE company_name = ?
-         ORDER BY id ASC`
-      : `SELECT 
-           id,
-           file_name AS name,
-           file_path AS path,
-           table_name,
-           status,
-           is_primary
-         FROM files
-         WHERE company_name IS NULL
-         ORDER BY id ASC`;
+    let uploadedQuery = "";
+    let uploadedParams = [];
 
-    const [uploadedFiles] = await db
-      .promise()
-      .query(uploadedQuery, company ? [company] : []);
+    if (isManager && isCompanyUser) {
+      // 👑 MANAGER → COMPANY FILES
+      uploadedQuery = `
+        SELECT id, file_name AS name, file_path AS path,
+               table_name, status, is_primary
+        FROM files
+        WHERE company_name = ?
+        ORDER BY id ASC`;
+      uploadedParams = [company_name];
+
+    } else if (isCompanyUser) {
+      // 👨‍💼 EMPLOYEE → OWN FILES
+      uploadedQuery = `
+        SELECT id, file_name AS name, file_path AS path,
+               table_name, status, is_primary
+        FROM files
+        WHERE uploaded_by = ?
+        ORDER BY id ASC`;
+      uploadedParams = [userId];
+
+    } else {
+      // 🧍 PERSONAL USER
+      uploadedQuery = `
+        SELECT id, file_name AS name, file_path AS path,
+               table_name, status, is_primary
+        FROM files
+        WHERE uploaded_by = ?
+        ORDER BY id ASC`;
+      uploadedParams = [userId];
+    }
+
+    const [uploadedFiles] = await db.promise().query(
+      uploadedQuery,
+      uploadedParams
+    );
 
     const uploadedFilesWithSource = uploadedFiles.map(f => ({
       id: `uploaded-${f.id}`,
@@ -1158,20 +1378,27 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 2️⃣ API FILES (FIXED)
+    // 2️⃣ API FILES
     // =============================
-    const apiQuery = company
-      ? `SELECT id, file_name AS name, file_path AS path
-         FROM api_data
-         WHERE company_name = ?`
-      : `SELECT id, file_name AS name, file_path AS path
-         FROM api_data
-         WHERE company_name IS NULL`;
+    let apiQuery = "";
+    let apiParams = [];
 
-    const [apiFiles] = await db.promise().query(
-      apiQuery,
-      company ? [company] : []
-    );
+    if (isManager && isCompanyUser) {
+      apiQuery = `
+        SELECT id, file_name AS name, file_path AS path
+        FROM api_data
+        WHERE company_name = ?`;
+      apiParams = [company_name];
+
+    } else {
+      apiQuery = `
+        SELECT id, file_name AS name, file_path AS path
+        FROM api_data
+        WHERE uploaded_by = ?`;
+      apiParams = [userId];
+    }
+
+    const [apiFiles] = await db.promise().query(apiQuery, apiParams);
 
     const apiFilesWithSource = apiFiles.map(f => ({
       id: `api-${f.id}`,
@@ -1184,32 +1411,37 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 3️⃣ PROCESSED TABLES (AUTO-FIXED)
+    // 3️⃣ PROCESSED TABLES
     // =============================
-    const allowedFilesQuery = company
-      ? `SELECT file_name FROM files WHERE company_name = ?`
-      : `SELECT file_name FROM files WHERE company_name IS NULL`;
+    let allowedFilesQuery = "";
+    let allowedParams = [];
+
+    if (isManager && isCompanyUser) {
+      allowedFilesQuery = `
+        SELECT file_name FROM files WHERE company_name = ?`;
+      allowedParams = [company_name];
+    } else {
+      allowedFilesQuery = `
+        SELECT file_name FROM files WHERE uploaded_by = ?`;
+      allowedParams = [userId];
+    }
 
     const [allowedFiles] = await db.promise().query(
       allowedFilesQuery,
-      company ? [company] : []
+      allowedParams
     );
 
     const allowedBaseNames = new Set(
       allowedFiles.map(f => f.file_name.toLowerCase())
     );
 
-    const [tables] = await db.promise().query(`SHOW TABLES`);
+    const [tables] = await db.promise().query("SHOW TABLES");
 
     const processedMap = {};
 
     tables.forEach(row => {
       const tableName = Object.values(row)[0].toLowerCase();
-
-      const match = tableName.match(
-        /(.+)_(fulltable|entity|metrics|dimension)$/
-      );
-
+      const match = tableName.match(/(.+)_(fulltable|entity|metrics|dimension)$/);
       if (!match) return;
 
       const baseName = match[1];
@@ -1228,7 +1460,7 @@ app.get("/files", authenticateToken, async (req, res) => {
     }));
 
     // =============================
-    // 4️⃣ STATUS FIX (UNCHANGED)
+    // 4️⃣ FINAL STATUS FIX
     // =============================
     const processedSet = new Set(
       processedFolders.map(p => p.folderName.toLowerCase())
@@ -1237,19 +1469,14 @@ app.get("/files", authenticateToken, async (req, res) => {
     const getBaseName = (name = "") =>
       name.toLowerCase().replace(/\.[^/.]+$/, "");
 
-    const allFiles = [
-      ...uploadedFilesWithSource,
-      ...apiFilesWithSource
-    ].map(f => {
-      const baseName = getBaseName(f.name);
-
-      let finalStatus;
-      if (f.status === "CANCEL") finalStatus = "CANCEL";
-      else if (processedSet.has(baseName)) finalStatus = "DONE";
-      else finalStatus = "NEW";
-
-      return { ...f, status: finalStatus };
-    });
+    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource]
+      .map(f => {
+        const baseName = getBaseName(f.name);
+        let finalStatus = "NEW";
+        if (f.status === "CANCEL") finalStatus = "CANCEL";
+        else if (processedSet.has(baseName)) finalStatus = "DONE";
+        return { ...f, status: finalStatus };
+      });
 
     // =============================
     // 5️⃣ RESPONSE
@@ -1267,178 +1494,47 @@ app.get("/files", authenticateToken, async (req, res) => {
 
 
 // =============================
-// GET PROCESSED TABLE DATA
+// GET PROCESSED TABLE DATA (FIXED)
 // =============================
-/// =============================
-// GET FILES (Uploaded + API + Processed)
-// =============================
-app.get("/files", authenticateToken, async (req, res) => {
+app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
   try {
-    const company = req.user.company_name || null;
+    const { tableName } = req.params;
+    const { company_name, viewOnly } = req.user;
 
-    // =============================
-    // 1️⃣ UPLOADED FILES (FIXED)
-    // =============================
-    const uploadedQuery = company
-      ? `SELECT 
-           id,
-           file_name AS name,
-           file_path AS path,
-           table_name,
-           status,
-           is_primary
-         FROM files
-         WHERE company_name = ?
-         ORDER BY id ASC`
-      : `SELECT 
-           id,
-           file_name AS name,
-           file_path AS path,
-           table_name,
-           status,
-           is_primary
-         FROM files
-         WHERE company_name IS NULL
-         ORDER BY id ASC`;
-
-    const [uploadedFiles] = await db
-      .promise()
-      .query(uploadedQuery, company ? [company] : []);
-
-    const uploadedFilesWithSource = uploadedFiles.map(f => ({
-      id: `uploaded-${f.id}`,
-      name: f.name,
-      path: f.path,
-      table_name: f.table_name,
-      status: f.status,
-      is_primary: f.is_primary,
-      source: "Uploaded File",
-      type: "uploaded"
-    }));
-
-    // =============================
-    // 2️⃣ API FILES (FIXED)
-    // =============================
-    const apiQuery = company
-      ? `SELECT id, file_name AS name, file_path AS path
-         FROM api_data
-         WHERE company_name = ?`
-      : `SELECT id, file_name AS name, file_path AS path
-         FROM api_data
-         WHERE company_name IS NULL`;
-
-    const [apiFiles] = await db.promise().query(
-      apiQuery,
-      company ? [company] : []
+    // 🔐 1. Get allowed base file names for this company
+    const [files] = await db.promise().query(
+      `SELECT file_name FROM files WHERE company_name = ?`,
+      [company_name]
     );
 
-    const apiFilesWithSource = apiFiles.map(f => ({
-      id: `api-${f.id}`,
-      name: f.name,
-      path: f.path,
-      source: "API Data",
-      type: "api",
-      status: "DONE",
-      is_primary: 1
-    }));
-
-    // =============================
-    // 3️⃣ PROCESSED TABLES (AUTO-FIXED)
-    // =============================
-    const allowedFilesQuery = company
-      ? `SELECT file_name FROM files WHERE company_name = ?`
-      : `SELECT file_name FROM files WHERE company_name IS NULL`;
-
-    const [allowedFiles] = await db.promise().query(
-      allowedFilesQuery,
-      company ? [company] : []
+    const allowedBaseNames = files.map(f =>
+      f.file_name.toLowerCase().replace(/\.[^/.]+$/, "")
     );
 
-    const allowedBaseNames = new Set(
-      allowedFiles.map(f => f.file_name.toLowerCase())
-    );
+    // 🔐 2. Extract base name from table
+    // example: sales_fulltable → sales
+    const baseName = tableName
+      .toLowerCase()
+      .replace(/_(fulltable|entity|metrics|dimension)$/, "");
 
-    const [tables] = await db.promise().query(`SHOW TABLES`);
+    // ❌ Not allowed for this company
+    if (!allowedBaseNames.includes(baseName)) {
+      return res.status(403).json({
+        success: false,
+        error: "Access denied for this table"
+      });
+    }
 
-    const processedMap = {};
-
-    tables.forEach(row => {
-      const tableName = Object.values(row)[0].toLowerCase();
-
-      const match = tableName.match(
-        /(.+)_(fulltable|entity|metrics|dimension)$/
-      );
-
-      if (!match) return;
-
-      const baseName = match[1];
-      if (!allowedBaseNames.has(baseName)) return;
-
-      if (!processedMap[baseName]) processedMap[baseName] = [];
-      processedMap[baseName].push(tableName);
-    });
-
-    const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
-      id: `processed-${idx}`,
-      folderName: baseName,
-      tables: processedMap[baseName],
-      type: "processed",
-      status: "DONE"
-    }));
-
-    // =============================
-    // 4️⃣ STATUS FIX (UNCHANGED)
-    // =============================
-    const processedSet = new Set(
-      processedFolders.map(p => p.folderName.toLowerCase())
-    );
-
-    const getBaseName = (name = "") =>
-      name.toLowerCase().replace(/\.[^/.]+$/, "");
-
-    const allFiles = [
-      ...uploadedFilesWithSource,
-      ...apiFilesWithSource
-    ].map(f => {
-      const baseName = getBaseName(f.name);
-
-      let finalStatus;
-      if (f.status === "CANCEL") finalStatus = "CANCEL";
-      else if (processedSet.has(baseName)) finalStatus = "DONE";
-      else finalStatus = "NEW";
-
-      return { ...f, status: finalStatus };
-    });
-
-    // =============================
-    // 5️⃣ RESPONSE
-    // =============================
-    res.json({
-      uploadedFiles: allFiles,
-      processedFolders
-    });
-
-  } catch (err) {
-    console.error("❌ Fetch Files Error:", err);
-    res.status(500).json({ error: "Error fetching files" });
-  }
-});
-
-
-// =============================
-// GET PROCESSED TABLE DATA
-// =============================
-app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
-  try {
-    const tableName = req.params.tableName;
-
+    // ✅ 3. Fetch table data
     const [rows] = await db
       .promise()
       .query(`SELECT * FROM \`${tableName}\``);
 
     res.json({
+      success: true,
       tableName,
-      rows
+      rows,
+      viewOnly: !!viewOnly
     });
 
   } catch (err) {
@@ -1450,10 +1546,28 @@ app.get('/processed-table/:tableName', authenticateToken, async (req, res) => {
   }
 });
 
+
 app.get("/dashboard-counts", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const company = req.user.company_name || null;
+    const { id: userId, role, company_name, viewOnly } = req.user;
+
+    // =============================
+    // 👀 VIEW-ONLY USER FIX (IMPORTANT)
+    // =============================
+    if (viewOnly) {
+      return res.json({
+        success: true,
+        me: {
+          uploadedFiles: 0,
+          uploadedApi: 0,
+          processedFiles: 0
+        },
+        company: null
+      });
+    }
+
+    const isManager = role === "manager";
+    const isCompanyUser = !!company_name;
 
     // =============================
     // 1️⃣ MY UPLOADED FILES
@@ -1504,25 +1618,24 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
     ).length;
 
     // =============================
-    // 5️⃣ COMPANY STATS
+    // 5️⃣ COMPANY STATS (MANAGER ONLY)
     // =============================
     let companyStats = null;
 
-    if (company) {
+    if (isManager && isCompanyUser) {
       const [[companyFiles]] = await promiseDb.query(
         `SELECT COUNT(*) AS count FROM files WHERE company_name = ?`,
-        [company]
+        [company_name]
       );
 
       const [[companyApi]] = await promiseDb.query(
         `SELECT COUNT(*) AS count FROM api_data WHERE company_name = ?`,
-        [company]
+        [company_name]
       );
 
-      // 🔥 COMPANY PROCESSED FILES
       const [companyNames] = await promiseDb.query(
         `SELECT file_name FROM files WHERE company_name = ?`,
-        [company]
+        [company_name]
       );
 
       const companyProcessed = companyNames.filter(f =>
@@ -1532,7 +1645,7 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
       companyStats = {
         uploadedFiles: companyFiles.count,
         uploadedApi: companyApi.count,
-        processedFiles: companyProcessed   // ✅ ADDED
+        processedFiles: companyProcessed
       };
     }
 
@@ -1554,7 +1667,6 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Dashboard failed" });
   }
 });
-
 
 
 // =============================
