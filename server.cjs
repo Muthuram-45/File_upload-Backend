@@ -24,13 +24,31 @@ const port = 5000;
 
 require('dotenv').config();
 
+function stableHash(data) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(sortObject(data)))
+    .digest("hex");
+}
+
+function sortObject(obj) {
+  if (Array.isArray(obj)) return obj.map(sortObject);
+  if (obj !== null && typeof obj === "object") {
+    return Object.keys(obj)
+      .sort()
+      .reduce((acc, k) => {
+        acc[k] = sortObject(obj[k]);
+        return acc;
+      }, {});
+  }
+  return obj;
+}
+
+
 // CommonJS require
-const openai = new OpenAI({
+const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
-// Initialize the OpenAI client
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
 // ✅ JWT Secret Key
@@ -162,34 +180,58 @@ function generateOtp() {
 app.post("/send-otp", async (req, res) => {
   try {
     let { email } = req.body;
-
+ 
     if (!email) {
-      return res.status(400).json({ success: false, error: "Email is required" });
+      return res.status(400).json({
+        success: false,
+        error: "Email is required"
+      });
     }
-
-    // ✅ NORMALIZE EMAIL
+ 
+    // ✅ normalize email
     email = email.trim().toLowerCase();
-
+ 
+    // 🔍 CHECK IF USER ALREADY REGISTERED
+    const [existing] = await db.promise().query(
+      "SELECT id FROM users WHERE email = ?",
+      [email]
+    );
+ 
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: "User already registered"
+      });
+    }
+ 
+    // 🔐 Generate OTP
     const otp = generateOtp();
-
+ 
     otpStore[email] = {
       otp,
-      expires: Date.now() + 10 * 60 * 1000
+      expires: Date.now() + 10 * 60 * 1000 // 10 mins
     };
-
+ 
     console.log(`📩 OTP ${otp} generated for ${email}`);
-
+ 
     await transporter.sendMail({
-      from: '"Muthu Ram - Verification" <muthuram921@gmail.com>',
+      from: '"Cloud360 Verification" <muthuram921@gmail.com>',
       to: email,
       subject: "Your OTP Verification Code",
-      html: `<h1>${otp}</h1><p>Valid for 10 minutes</p>`
+      html: `<h2>${otp}</h2><p>OTP valid for 10 minutes</p>`
     });
-
-    res.json({ success: true, message: "OTP sent" });
+ 
+    res.json({
+      success: true,
+      message: "OTP sent successfully"
+    });
+ 
   } catch (err) {
-    console.error("OTP error:", err);
-    res.status(500).json({ success: false, error: "OTP failed" });
+    console.error("❌ OTP Error:", err);
+    res.status(500).json({
+      success: false,
+      error: "Failed to send OTP"
+    });
   }
 });
 
@@ -280,81 +322,31 @@ app.post('/register', async (req, res) => {
     const { firstName, lastName, email, mobile, password } = req.body;
 
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Email and password required' });
-    }
-
-    // 🔍 Check existing user
-    const [existing] = await db
-      .promise()
-      .query('SELECT id FROM users WHERE email = ?', [email]);
-
-    if (existing.length > 0) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'User already registered' });
-    }
-
-    // 🔐 Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // 🔥 AUTO DETECT ROLE + COMPANY
-    const role = "personal";      // ✅ always personal
-    const company_name = null;   // ✅ no company
-
-
-    // 💾 Insert user
-    const status = "ACTIVE"; // 🔥 AUTO ACTIVATE PERSONAL USER
-
-    await db.promise().query(
-      `INSERT INTO users
-   (first_name, last_name, email, mobile, password, company_name, role, status)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        firstName,
-        lastName,
-        email,
-        mobile || '',
-        hashedPassword,
-        company_name,
-        role,
-        status
-      ]
-    );
-
-
-    res.json({
-      success: true,
-      message: '✅ User registered successfully',
-      role,
-      company_name
-    });
-  } catch (err) {
-    console.error('❌ Register Error:', err);
-    res.status(500).json({
-      success: false,
-      error: 'Internal Server Error'
-    });
-  }
-});
-
-
-app.post('/company-register', async (req, res) => {
-  try {
-    const { firstName, lastName, email, mobile, password } = req.body;
-
-    if (!email || !password) {
       return res.status(400).json({
         success: false,
         error: 'Email and password required'
       });
     }
 
-    // 🔍 Check if email already exists
-    const [existing] = await db
-      .promise()
-      .query('SELECT id FROM users WHERE email = ?', [email]);
+    // ✅ Normalize email
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // 🚫 BLOCK COMPANY EMAILS FOR NORMAL REGISTER
+    const allowedDomains = ['gmail.com', 'yahoo.com', 'outlook.com'];
+    const emailDomain = normalizedEmail.split('@')[1];
+
+    if (!allowedDomains.includes(emailDomain)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only Gmail, Yahoo, or Outlook emails are allowed for personal registration'
+      });
+    }
+
+    // 🔍 Check existing user
+    const [existing] = await db.promise().query(
+      'SELECT id FROM users WHERE email = ?',
+      [normalizedEmail]
+    );
 
     if (existing.length > 0) {
       return res.status(400).json({
@@ -366,12 +358,75 @@ app.post('/company-register', async (req, res) => {
     // 🔐 Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // 🔥 FORCE PERSONAL USER
+    const role = 'personal';
+    const company_name = null;
+    const status = 'ACTIVE';
+
+    await db.promise().query(
+      `INSERT INTO users
+       (first_name, last_name, email, mobile, password, company_name, role, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        firstName,
+        lastName,
+        normalizedEmail,
+        mobile || '',
+        hashedPassword,
+        company_name,
+        role,
+        status
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: '✅ User registered successfully',
+      role,
+      company_name
+    });
+
+  } catch (err) {
+    console.error('❌ Register Error:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error'
+    });
+  }
+});
+
+app.post('/company-register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, mobile, password } = req.body;
+ 
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password required'
+      });
+    }
+ 
+    // 🔍 Check if email already exists
+    const [existing] = await db
+      .promise()
+      .query('SELECT id FROM users WHERE email = ?', [email]);
+ 
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'User already registered. Please login.'
+      });
+    }
+ 
+    // 🔐 Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+ 
     // ✅ USE YOUR EXISTING ROLE DETECTOR
     const { role, company_name } = detectRoleAndCompany(email);
-
+ 
     // 🔥 STATUS RULE (THIS IS NEW)
     const status = role === 'employee' ? 'PENDING' : 'ACTIVE';
-
+ 
     // 💾 INSERT USER
     await db.promise().query(
       `INSERT INTO users
@@ -388,23 +443,23 @@ app.post('/company-register', async (req, res) => {
         status
       ]
     );
-
+ 
     // 📧 SEND APPROVAL EMAIL ONLY FOR EMPLOYEE
     if (role === 'employee') {
       const [managers] = await db.promise().query(
         `SELECT email FROM users WHERE role = 'manager' AND company_name = ?`,
         [company_name]
       );
-
+ 
       if (managers.length > 0) {
         const approveToken = jwt.sign(
           { email, company_name },
           secret_key,
           { expiresIn: '48h' }
         );
-
+ 
         const approveLink = `http://localhost:5000/approve-employee?token=${approveToken}`;
-
+ 
         await transporter.sendMail({
           to: managers[0].email,
           subject: 'Employee Approval Required',
@@ -417,7 +472,7 @@ app.post('/company-register', async (req, res) => {
         });
       }
     }
-
+ 
     res.json({
       success: true,
       message:
@@ -427,16 +482,16 @@ app.post('/company-register', async (req, res) => {
       role,
       status
     });
-
+ 
   } catch (err) {
     console.error('❌ Company Register Error:', err);
-    res.status(500).json({
+ 
+    return res.status(500).json({
       success: false,
       error: 'Internal Server Error'
     });
   }
 });
-
 app.get('/approve-employee', async (req, res) => {
   try {
     const { token } = req.query;
@@ -482,8 +537,8 @@ app.post('/login', async (req, res) => {
 
     const user = rows[0];
 
-    // 🔐 ✅ BLOCK LOGIN UNTIL MANAGER APPROVAL
-    if (user.status !== 'ACTIVE') {
+    // 🔐 ✅ BLOCK LOGIN ONLY FOR COMPANY EMPLOYEES
+    if (user.role !== 'personal' && user.status !== 'ACTIVE') {
       return res.status(403).json({
         success: false,
         error:
@@ -492,6 +547,7 @@ app.post('/login', async (req, res) => {
             : 'Account rejected'
       });
     }
+
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
@@ -1017,7 +1073,6 @@ app.get("/fetch-api", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Fetch failed" });
   }
 });
-
 app.post("/fetch-api", authenticateToken, async (req, res) => {
   try {
     if (req.user.viewOnly) {
@@ -1028,7 +1083,6 @@ app.post("/fetch-api", authenticateToken, async (req, res) => {
     }
 
     const { url, file_name } = req.body;
-
     if (!url || !file_name) {
       return res.status(400).json({
         success: false,
@@ -1036,93 +1090,71 @@ app.post("/fetch-api", authenticateToken, async (req, res) => {
       });
     }
 
-    // 🔐 external API token (optional)
     const externalToken =
       req.headers["x-api-key"] || req.headers["authorization-external"];
 
     const headers = {};
     if (externalToken) {
-      headers["Authorization"] = externalToken.startsWith("Bearer")
+      headers.Authorization = externalToken.startsWith("Bearer")
         ? externalToken
         : `Bearer ${externalToken}`;
     }
 
-    // 🌐 FETCH API
     const apiResponse = await axios.get(url, { headers });
-    const newData = apiResponse.data;
+
+    const raw = Array.isArray(apiResponse.data)
+      ? apiResponse.data
+      : [apiResponse.data];
+
+    // 🔥 Use same hashing as cron
+    const hash = stableHash(raw);
 
     const companyName = req.user.company_name || null;
     const uploadedBy = req.user.id;
-
-    // 🕒 TIME
     const now = new Date();
-    const nextHour = new Date(now.getTime() + 60 * 60 * 1000);
+    const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
 
-    // ✅ SAFE FILE NAME (single source of truth)
     const safeName = file_name
       .trim()
       .toLowerCase()
       .replace(/\s+/g, "_")
       .replace(/[^a-z0-9_]/g, "");
 
-    // 🔍 CHECK EXISTING ROW
     const [existing] = await db.promise().query(
-      `SELECT id FROM api_data
-       WHERE file_name = ? AND company_name <=> ?`,
+      `SELECT id FROM api_data WHERE file_name = ? AND company_name <=> ?`,
       [safeName, companyName]
     );
 
     if (existing.length === 0) {
-      // 🆕 INSERT
+      // 🆕 insert
       await db.promise().query(
         `INSERT INTO api_data
-         (api_url, file_name, response, company_name, uploaded_by,
+         (api_url, file_name, response, response_hash, company_name, uploaded_by,
           status, last_processed_at, next_process_at)
-         VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?)`,
-        [
-          url,
-          safeName,
-          JSON.stringify(newData),
-          companyName,
-          uploadedBy,
-          now,
-          nextHour
-        ]
+         VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?)`,
+        [url, safeName, JSON.stringify(raw), hash, companyName, uploadedBy, now, nextRun]
       );
     } else {
-      // ♻️ UPDATE SAME ROW
+      // ♻️ update → always mark NEW (cron will decide DONE later)
       await db.promise().query(
         `UPDATE api_data
          SET api_url = ?,
              response = ?,
-             status = 'DONE',
+             response_hash = ?,
+             status = 'NEW',
              last_processed_at = ?,
              next_process_at = ?
          WHERE id = ?`,
-        [
-          url,
-          JSON.stringify(newData),
-          now,
-          nextHour,
-          existing[0].id
-        ]
+        [url, JSON.stringify(raw), hash, now, nextRun, existing[0].id]
       );
     }
 
-    return res.json({
-      success: true,
-      data: newData
-    });
-
+    res.json({ success: true, data: raw });
   } catch (err) {
     console.error("❌ Fetch API Error:", err.message);
-    return res.status(500).json({
-      success: false,
-      error: "Fetch failed"
-    });
+    res.status(500).json({ success: false, error: "Fetch failed" });
   }
 });
-
 app.post("/save-api-data", authenticateToken, async (req, res) => {
   try {
     if (req.user.viewOnly) {
@@ -1130,23 +1162,32 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
     }
 
     const { api_url, file_name, response } = req.body;
-
     if (!api_url || !file_name || !response) {
       return res.status(400).json({ error: "Missing data" });
     }
 
+    // 🔹 Safe file name
     const safeName = file_name
       .trim()
       .toLowerCase()
       .replace(/\s+/g, "_")
       .replace(/[^a-z0-9_]/g, "");
 
+    // 🔹 Always keep RAW API JSON
+    const raw = Array.isArray(response) ? response : [response];
+
+    // 🔥 Hash must be SAME as cron (no cleaning, no filtering)
+    const hash = stableHash(raw);
+
     const now = new Date();
-    const nextHour = new Date(now.getTime() + 60 * 60 * 1000);
+    const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
 
     const externalToken =
-      req.headers["authorization-external"] || req.headers["x-api-key"] || null;
+      req.headers["authorization-external"] ||
+      req.headers["x-api-key"] ||
+      null;
 
+    // 🔍 Prevent duplicate API names per company
     const [existing] = await db.promise().query(
       `SELECT id FROM api_data WHERE file_name = ? AND company_name <=> ?`,
       [safeName, req.user.company_name || null]
@@ -1156,20 +1197,22 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
       return res.status(409).json({ error: "File name already exists" });
     }
 
+    // 💾 Store RAW JSON + HASH
     await db.promise().query(
       `INSERT INTO api_data
-       (api_url, file_name, response, company_name, uploaded_by,
+       (api_url, file_name, response, response_hash, company_name, uploaded_by,
         status, last_processed_at, next_process_at, api_token)
-       VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?)`,
       [
         api_url,
         safeName,
-        JSON.stringify(response),
+        JSON.stringify(raw),
+        hash,
         req.user.company_name || null,
         req.user.id,
         now,
-        nextHour,
-        externalToken,
+        nextRun,
+        externalToken
       ]
     );
 
@@ -1181,132 +1224,7 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
 });
 
 
-app.post("/fetch-api", authenticateToken, async (req, res) => {
-  try {
-    if (req.user.viewOnly) {
-      return res.status(403).json({
-        success: false,
-        error: "View-only access. Fetch API disabled",
-      });
-    }
-
-    const { url, file_name } = req.body;
-    if (!url || !file_name) {
-      return res.status(400).json({
-        success: false,
-        error: "API URL and File Name are required",
-      });
-    }
-
-    // 🔐 external API token (SAVE IT)
-    const externalToken =
-      req.headers["authorization-external"] || req.headers["x-api-key"];
-
-    const headers = {};
-    if (externalToken) {
-      headers["Authorization"] = externalToken.startsWith("Bearer")
-        ? externalToken
-        : `Bearer ${externalToken}`;
-    }
-
-    const apiResponse = await axios.get(url, { headers });
-    const newData = apiResponse.data;
-
-    const companyName = req.user.company_name || null;
-    const uploadedBy = req.user.id;
-
-    const now = new Date();
-    const nextHour = new Date(now.getTime() + 60 * 60 * 1000);
-
-    const safeName = file_name
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_")
-      .replace(/[^a-z0-9_]/g, "");
-
-    // 🔍 check existing
-    const [existing] = await db.promise().query(
-      `SELECT id FROM api_data
-       WHERE file_name = ? AND company_name <=> ?`,
-      [safeName, companyName]
-    );
-
-    if (existing.length === 0) {
-      // 🆕 INSERT
-      await db.promise().query(
-        `INSERT INTO api_data
-         (api_url, file_name, response, company_name, uploaded_by,
-          status, last_processed_at, next_process_at, api_token)
-         VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?, ?)`,
-        [
-          url,
-          safeName,
-          JSON.stringify(newData),
-          companyName,
-          uploadedBy,
-          now,
-          nextHour,
-          externalToken || null,
-        ]
-      );
-    } else {
-      // ♻️ UPDATE (manual save = still NEW)
-      await db.promise().query(
-        `UPDATE api_data
-         SET api_url = ?,
-             response = ?,
-             status = 'NEW',
-             last_processed_at = ?,
-             next_process_at = ?,
-             api_token = ?
-         WHERE id = ?`,
-        [
-          url,
-          JSON.stringify(newData),
-          now,
-          nextHour,
-          externalToken || null,
-          existing[0].id,
-        ]
-      );
-    }
-
-    res.json({
-      success: true,
-      message: "API saved successfully",
-    });
-  } catch (err) {
-    console.error("❌ Save API Error:", err.message);
-    res.status(500).json({ success: false, error: "Save failed" });
-  }
-});
-
-
-function normalizeJson(value) {
-  try {
-    // already object or array
-    if (typeof value === "object" && value !== null) {
-      return JSON.stringify(value);
-    }
-
-    // valid JSON string
-    if (typeof value === "string") {
-      return JSON.stringify(JSON.parse(value));
-    }
-
-    // fallback
-    return JSON.stringify(null);
-  } catch (err) {
-    // invalid JSON like "[object Object]"
-    return JSON.stringify(null);
-  }
-}
-
-
-// =============================
-// ⏰ API CRON (EVERY 5 MINUTES)
-// =============================
-cron.schedule("0 * * * *", async () => {
+cron.schedule("*/5 * * * *", async () => {
   console.log("⏰ API cron started (every 5 minutes)");
 
   try {
@@ -1314,7 +1232,7 @@ cron.schedule("0 * * * *", async () => {
       SELECT 
         id,
         api_url,
-        response,
+        response_hash,
         api_token,
         last_processed_at
       FROM api_data
@@ -1322,12 +1240,9 @@ cron.schedule("0 * * * *", async () => {
 
     for (const api of apis) {
       const now = new Date();
-      const nextRun = new Date(now.getTime() + 60 * 60 * 1000);
+      const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
 
       try {
-        // =============================
-        // 🔐 HEADERS
-        // =============================
         const headers = { "User-Agent": "Cloud360-Cron/1.0" };
 
         if (api.api_token) {
@@ -1336,73 +1251,51 @@ cron.schedule("0 * * * *", async () => {
             : `Bearer ${api.api_token}`;
         }
 
-        // =============================
-        // 🌐 FETCH API
-        // =============================
         const res = await axios.get(api.api_url, {
           timeout: 15000,
           headers,
         });
 
-        const newData = Array.isArray(res.data)
+        const rawNewData = Array.isArray(res.data)
           ? res.data
           : [res.data];
 
-        // =============================
-        // 🧮 OLD DATA COUNT (SAFE)
-        // =============================
-        let oldCount = 0;
-        try {
-          const oldParsed = api.response
-            ? JSON.parse(api.response)
-            : [];
-          oldCount = Array.isArray(oldParsed)
-            ? oldParsed.length
-            : 1;
-        } catch {
-          oldCount = 0;
-        }
+        // 🔥 Stable hash of raw response
+        const newHash = stableHash(rawNewData);
+        const oldHash = api.response_hash || null;
 
-        const newCount = newData.length;
-
-        // =============================
-        // ✅ STATUS RULE (YOUR REQUIREMENT)
-        // =============================
-        const isNewData = newCount > oldCount;
+        const isNewData = newHash !== oldHash;
         const status = isNewData ? "NEW" : "DONE";
+        const lastProcessedAt = isNewData ? now : api.last_processed_at;
 
         await db.promise().query(
           `
           UPDATE api_data
           SET
             response = ?,
+            response_hash = ?,
             status = ?,
             last_processed_at = ?,
             next_process_at = ?
           WHERE id = ?
           `,
           [
-            JSON.stringify(newData),
+            JSON.stringify(rawNewData),
+            newHash,
             status,
-            isNewData ? now : api.last_processed_at,
+            lastProcessedAt,
             nextRun,
             api.id,
           ]
         );
 
-        console.log(
-          `✔ ${api.api_url} → ${status} (old: ${oldCount}, new: ${newCount})`
-        );
+        console.log(`✔ ${api.api_url} → ${status}`);
 
       } catch (apiErr) {
         console.error("❌ API fetch failed:", api.api_url, apiErr.message);
 
         await db.promise().query(
-          `
-          UPDATE api_data
-          SET next_process_at = ?
-          WHERE id = ?
-          `,
+          `UPDATE api_data SET next_process_at = ? WHERE id = ?`,
           [nextRun, api.id]
         );
       }
@@ -1411,7 +1304,6 @@ cron.schedule("0 * * * *", async () => {
     console.error("❌ Cron fatal error:", err.message);
   }
 });
-
 
 
 // --------------------------------------------------------
@@ -1842,13 +1734,11 @@ app.post("/upload", authenticateToken, (req, res, next) => {
 );
 
 // =============================
-// GET FILES (ROLE BASED - FINAL - FIXED)
+// GET FILES (COMPANY BASED - FINAL)
 // =============================
 app.get("/files", authenticateToken, async (req, res) => {
   try {
-    const { role, company_name, id: userId } = req.user;
-
-    const isManager = role === "manager";
+    const { company_name, id: userId } = req.user;
     const isCompanyUser = !!company_name;
 
     // =============================
@@ -1857,32 +1747,35 @@ app.get("/files", authenticateToken, async (req, res) => {
     let uploadedQuery = "";
     let uploadedParams = [];
 
-    if (isManager && isCompanyUser) {
+    if (isCompanyUser) {
       uploadedQuery = `
-        SELECT id,
-               file_name AS name,
-               file_path AS path,
-               status
+        SELECT 
+          id,
+          file_name AS name,
+          file_path AS path,
+          status,
+          processed_at,
+          completed_at
         FROM files
         WHERE company_name = ?
         ORDER BY id ASC`;
       uploadedParams = [company_name];
     } else {
       uploadedQuery = `
-        SELECT id,
-               file_name AS name,
-               file_path AS path,
-               status
+        SELECT 
+          id,
+          file_name AS name,
+          file_path AS path,
+          status,
+          processed_at,
+          completed_at
         FROM files
         WHERE uploaded_by = ?
         ORDER BY id ASC`;
       uploadedParams = [userId];
     }
 
-    const [uploadedFiles] = await db.promise().query(
-      uploadedQuery,
-      uploadedParams
-    );
+    const [uploadedFiles] = await db.promise().query(uploadedQuery, uploadedParams);
 
     const uploadedFilesWithSource = uploadedFiles.map(f => ({
       id: `uploaded-${f.id}`,
@@ -1891,37 +1784,37 @@ app.get("/files", authenticateToken, async (req, res) => {
       status: f.status,
       source: "Uploaded File",
       type: "uploaded",
-
-      // ⛔ Uploaded files do NOT have schedule
-      last_processed_at: null,
-      next_process_at: null
+      processed_at: f.processed_at,
+      completed_at: f.completed_at
     }));
 
     // =============================
-    // 2️⃣ API FILES (NULL SAFE + TIME FIELDS)
+    // 2️⃣ API FILES
     // =============================
     let apiQuery = "";
     let apiParams = [];
 
-    if (isManager && isCompanyUser) {
+    if (isCompanyUser) {
       apiQuery = `
-        SELECT id,
-               COALESCE(file_name, CONCAT('api_', id)) AS name,
-               file_path AS path,
-               status,
-               last_processed_at,
-               next_process_at
+        SELECT 
+          id,
+          COALESCE(file_name, CONCAT('api_', id)) AS name,
+          file_path AS path,
+          status,
+          last_processed_at,
+          next_process_at
         FROM api_data
         WHERE company_name = ?`;
       apiParams = [company_name];
     } else {
       apiQuery = `
-        SELECT id,
-               COALESCE(file_name, CONCAT('api_', id)) AS name,
-               file_path AS path,
-               status,
-               last_processed_at,
-               next_process_at
+        SELECT 
+          id,
+          COALESCE(file_name, CONCAT('api_', id)) AS name,
+          file_path AS path,
+          status,
+          last_processed_at,
+          next_process_at
         FROM api_data
         WHERE uploaded_by = ?`;
       apiParams = [userId];
@@ -1936,19 +1829,17 @@ app.get("/files", authenticateToken, async (req, res) => {
       source: "API Data",
       type: "api",
       status: f.status || "DONE",
-
-      // ✅ TIME FIELDS (THIS WAS THE MISSING PART)
       last_processed_at: f.last_processed_at,
       next_process_at: f.next_process_at
     }));
 
     // =============================
-    // 3️⃣ PROCESSED TABLES (FILES + API)
+    // 3️⃣ PROCESSED TABLES (COMPANY SAFE)
     // =============================
     let allowedFilesQuery = "";
     let allowedParams = [];
 
-    if (isManager && isCompanyUser) {
+    if (isCompanyUser) {
       allowedFilesQuery = `
         SELECT file_name FROM files WHERE company_name = ?
         UNION
@@ -1962,17 +1853,12 @@ app.get("/files", authenticateToken, async (req, res) => {
       allowedParams = [userId, userId];
     }
 
-    const [allowedFiles] = await db.promise().query(
-      allowedFilesQuery,
-      allowedParams
-    );
+    const [allowedFiles] = await db.promise().query(allowedFilesQuery, allowedParams);
 
     const allowedBaseNames = new Set(
       allowedFiles
         .filter(f => f.file_name)
-        .map(f =>
-          f.file_name.toLowerCase().replace(/\.[^/.]+$/, "")
-        )
+        .map(f => f.file_name.toLowerCase().replace(/\.[^/.]+$/, ""))
     );
 
     const [tables] = await db.promise().query("SHOW TABLES");
@@ -2009,14 +1895,17 @@ app.get("/files", authenticateToken, async (req, res) => {
     const getBaseName = (name = "") =>
       name.toLowerCase().replace(/\.[^/.]+$/, "");
 
-    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource]
-      .map(f => {
-        const baseName = getBaseName(f.name);
-        let finalStatus = "NEW";
-        if (f.status === "CANCEL") finalStatus = "CANCEL";
-        else if (processedSet.has(baseName)) finalStatus = "DONE";
-        return { ...f, status: finalStatus };
-      });
+    const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource].map(f => {
+      const baseName = getBaseName(f.name);
+      let finalStatus = f.status;
+
+      if (f.status === "CANCEL") finalStatus = "CANCEL";
+      else if (f.status === "PROCESSING") finalStatus = "PROCESSING";
+      else if (processedSet.has(baseName)) finalStatus = "DONE";
+      else finalStatus = "NEW";
+
+      return { ...f, status: finalStatus };
+    });
 
     // =============================
     // 5️⃣ RESPONSE
@@ -2033,14 +1922,18 @@ app.get("/files", authenticateToken, async (req, res) => {
 });
 
 
+
 // =============================
 // GET PROCESSED TABLE DATA (FIXED)
 // =============================
 app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
   try {
     const { tableName } = req.params;
-    const { company_name, uploaded_by, viewOnly } = req.user;
+    const { company_name, viewOnly } = req.user;
 
+    // ============================================
+    // 1️⃣ SECURITY: Allow only files belonging to company
+    // ============================================
     const [files] = await db.promise().query(
       `
       SELECT file_name FROM files WHERE company_name = ?
@@ -2052,9 +1945,7 @@ app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
 
     const allowedBaseNames = files
       .filter(f => f.file_name)
-      .map(f =>
-        f.file_name.toLowerCase().replace(/\.[^/.]+$/, "")
-      );
+      .map(f => f.file_name.toLowerCase().replace(/\.[^/.]+$/, ""));
 
     const baseName = tableName
       .toLowerCase()
@@ -2067,14 +1958,43 @@ app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
       });
     }
 
-    const [rows] = await db
-      .promise()
-      .query(`SELECT * FROM \`${tableName}\``);
+    // ============================================
+    // 2️⃣ HARD RULE: Spark table must exist
+    // ============================================
+    const [[exists]] = await db.promise().query(
+      `
+      SELECT COUNT(*) AS count
+      FROM information_schema.tables
+      WHERE table_schema = DATABASE()
+      AND table_name = ?
+      `,
+      [tableName]
+    );
+
+    // 🔥 If Spark has not created this table yet
+    if (exists.count === 0) {
+      return res.json({
+        success: true,
+        tableName,
+        rows: [],               // ❌ No raw JSON allowed
+        status: "WAITING",      // frontend can show spinner
+        message: "Waiting for PySpark processing",
+        viewOnly: !!viewOnly
+      });
+    }
+
+    // ============================================
+    // 3️⃣ Fetch Spark processed table
+    // ============================================
+    const [rows] = await db.promise().query(
+      `SELECT * FROM \`${tableName}\``
+    );
 
     res.json({
       success: true,
       tableName,
       rows,
+      status: "READY",
       viewOnly: !!viewOnly
     });
 
@@ -2405,72 +2325,240 @@ app.put('/change-mobile', async (req, res) => {
   }
 });
 
+// =============================
+// 🧠 NLP HELPERS
+// =============================
+function extractTableNames(sql) {
+  const regex = /\bfrom\s+([a-zA-Z0-9_`]+)|\bjoin\s+([a-zA-Z0-9_`]+)/gi;
+  const tables = new Set();
+  let match;
 
-app.post("/nlq-search", async (req, res) => {
+  while ((match = regex.exec(sql)) !== null) {
+    const table = (match[1] || match[2]).replace(/`/g, "");
+    tables.add(table);
+  }
+  return [...tables];
+}
+
+function normalizeSQL(sql) {
+  if (!sql) return "";
+  sql = sql.replace(/;\s*LIMIT/gi, " LIMIT");
+  sql = sql.replace(/;\s*$/g, "");
+  return sql.trim();
+}
+
+// =============================
+// 🧠 Allow ONLY Metric Questions
+// =============================
+function isAggregateOrMathQuestion(question) {
+  const q = question.toLowerCase();
+
+  const keywords = [
+    "total","sum","average","avg","mean",
+    "count","how many",
+    "minimum","min","maximum","max",
+    "percentage","percent","%",
+    "ratio","rate",
+    "difference","increase","decrease",
+    "growth","compare","vs","divided","per"
+  ];
+
+  return keywords.some(k => q.includes(k));
+}
+
+// =============================
+// 🧠 NLQ → SQL → METRICS ONLY
+// =============================
+app.post("/nlp/query", authenticateToken, async (req, res) => {
   try {
-    const { question, tableName } = req.body;
+    const { question, baseName } = req.body;
 
-    if (!question || !tableName) {
-      return res.status(400).json({ error: "Missing input" });
+    if (!question || !baseName) {
+      return res.status(400).json({ error: "question and baseName are required" });
     }
 
-    const [rows] = await promiseDb.query(
-      `SELECT * FROM \`${tableName}\` LIMIT 30`
+    console.log("📦 DATASET:", baseName);
+    console.log("🧠 QUESTION:", question);
+
+    // 🚫 Block non-metric questions
+    if (!isAggregateOrMathQuestion(question)) {
+      return res.status(400).json({
+        error: "Only aggregate and arithmetic questions are allowed",
+        examples: [
+          "total sales by region",
+          "average revenue",
+          "win percentage",
+          "sum of runs",
+          "highest score"
+        ]
+      });
+    }
+
+    // =============================
+    // 1️⃣ Tables
+    // =============================
+    const tables = {
+      entity: `${baseName}_entity`,
+      metrics: `${baseName}_metrics`,
+      dimension: `${baseName}_dimension`,
+    };
+
+    // =============================
+    // 2️⃣ Validate tables
+    // =============================
+    for (const t in tables) {
+      try {
+        await promiseDb.query(`SELECT 1 FROM \`${tables[t]}\` LIMIT 1`);
+      } catch {
+        tables[t] = null;
+      }
+    }
+
+    if (!tables.entity && !tables.metrics && !tables.dimension) {
+      return res.status(400).json({ error: "No processed tables found" });
+    }
+
+    // =============================
+    // 3️⃣ Fetch columns
+    // =============================
+    const allColumns = {};
+    const columnMap = {};
+
+    for (const t in tables) {
+      if (!tables[t]) continue;
+
+      const [cols] = await promiseDb.query(`SHOW COLUMNS FROM \`${tables[t]}\``);
+      allColumns[t] = cols.map(c => c.Field);
+
+      cols.forEach(c => {
+        columnMap[c.Field.toLowerCase()] = tables[t];
+      });
+    }
+
+    // =============================
+    // 4️⃣ Detect columns from question
+    // =============================
+    const questionLower = question.toLowerCase();
+
+    const requiredColumns = Object.keys(columnMap).filter(col =>
+      questionLower.includes(col.replace("_"," "))
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ error: "Table is empty" });
+    const requiredTables = new Set();
+    requiredColumns.forEach(c => requiredTables.add(columnMap[c]));
+
+    // =============================
+    // 5️⃣ Enforce joins
+    // =============================
+    let enforcedJoin = "";
+
+    if (requiredTables.has(tables.entity) && requiredTables.has(tables.dimension)) {
+      enforcedJoin = `JOIN ${tables.dimension} dd ON de.auto_id = dd.auto_id`;
     }
 
-    // Convert table rows → readable text
-    const tableText = rows
-      .map((row, i) =>
-        `${i + 1}. ${Object.entries(row)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join(", ")}`
-      )
-      .join("\n");
+    // =============================
+    // 6️⃣ LLM Prompt (Metrics Only)
+    // =============================
+    let prompt = "You are a strict MySQL analytics SQL generator.\n\n";
 
-    const prompt = `
-You are a data analyst.
-Answer ONLY using the table data.
-If the answer is not present, say "Not available".
-Give a short, clear answer.
+    for (const t in allColumns) {
+      prompt += `Table: ${tables[t]}\n`;
+      prompt += `Columns: ${allColumns[t].join(", ")}\n\n`;
+    }
 
-Question:
-${question}
+    prompt += `
+STRICT RULES:
+- You MUST use SUM, AVG, COUNT, MIN or MAX
+- You MAY use + - * / % on aggregated values
+- NEVER return row level data
+- NEVER use SELECT *
+- NEVER select raw columns without aggregation
+- Use ONLY tables above
+- ${tables.entity} must be de
+- ${tables.metrics} must be dm
+- ${tables.dimension} must be dd
+- Join ONLY on auto_id
+- DO NOT use LIMIT
+- Return ONLY SQL
 
-Table Data:
-${tableText}
+JOIN TO USE:
+FROM ${tables.entity} de
+${enforcedJoin}
+
+User Question: "${question}"
 `;
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini", // ✅ best for NLQ
-      messages: [
-        { role: "system", content: "You answer questions from tabular data." },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0.2,
+    // =============================
+    // 7️⃣ Call OpenAI
+    // =============================
+    const aiRes = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0,
     });
 
-    const answer =
-      completion.choices?.[0]?.message?.content ||
-      "No answer generated";
+    let sql = aiRes.choices[0].message.content
+      .replace(/```sql|```/gi, "")
+      .trim();
 
-    res.json([
-      {
-        result: answer.trim(),
-      },
-    ]);
+    // =============================
+    // 8️⃣ Safety Check
+    // =============================
+    sql = normalizeSQL(sql);
+    const lowerSql = sql.toLowerCase();
+
+    const forbidden = ["drop","delete","update","insert","alter","truncate"];
+    if (!lowerSql.startsWith("select") || forbidden.some(w => lowerSql.includes(w))) {
+      return res.status(400).json({ error: "Unsafe SQL", sql });
+    }
+
+    const isAgg = ["sum(","avg(","count(","min(","max("].some(f => lowerSql.includes(f));
+
+    // 🚫 Block non-aggregate SQL
+    if (!isAgg) {
+      return res.status(400).json({
+        error: "Only aggregate or arithmetic SQL allowed",
+        sql
+      });
+    }
+
+    // =============================
+    // 9️⃣ Validate tables used
+    // =============================
+    const allowedTables = Object.values(tables).filter(Boolean);
+    const usedTables = extractTableNames(sql);
+
+    const invalidTables = usedTables.filter(t => !allowedTables.includes(t));
+    if (invalidTables.length > 0) {
+      return res.status(400).json({
+        error: "Invalid tables used",
+        invalidTables,
+        allowedTables,
+        sql
+      });
+    }
+
+    console.log("🧠 FINAL SQL:", sql);
+
+    // =============================
+    // 🔟 Execute
+    // =============================
+    const [result] = await promiseDb.query(sql);
+
+    res.json({
+      success: true,
+      baseName,
+      sql,
+      result,
+      message: result.length === 0 ? "No data found" : undefined
+    });
 
   } catch (err) {
-    console.error("❌ OpenAI NLQ Error:", err);
-    res.status(500).json({
-      error: "NLQ failed",
-      message: err.message,
-    });
+    console.error("❌ NLP ERROR:", err);
+    res.status(500).json({ error: " Currently working is progress" });
   }
 });
+
 
 
 // =============================
