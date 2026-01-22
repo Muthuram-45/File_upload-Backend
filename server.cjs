@@ -180,52 +180,52 @@ function generateOtp() {
 app.post("/send-otp", async (req, res) => {
   try {
     let { email } = req.body;
- 
+
     if (!email) {
       return res.status(400).json({
         success: false,
         error: "Email is required"
       });
     }
- 
+
     // ✅ normalize email
     email = email.trim().toLowerCase();
- 
+
     // 🔍 CHECK IF USER ALREADY REGISTERED
     const [existing] = await db.promise().query(
       "SELECT id FROM users WHERE email = ?",
       [email]
     );
- 
+
     if (existing.length > 0) {
       return res.status(409).json({
         success: false,
         error: "User already registered"
       });
     }
- 
+
     // 🔐 Generate OTP
     const otp = generateOtp();
- 
+
     otpStore[email] = {
       otp,
       expires: Date.now() + 10 * 60 * 1000 // 10 mins
     };
- 
+
     console.log(`📩 OTP ${otp} generated for ${email}`);
- 
+
     await transporter.sendMail({
       from: '"Cloud360 Verification" <muthuram921@gmail.com>',
       to: email,
       subject: "Your OTP Verification Code",
       html: `<h2>${otp}</h2><p>OTP valid for 10 minutes</p>`
     });
- 
+
     res.json({
       success: true,
       message: "OTP sent successfully"
     });
- 
+
   } catch (err) {
     console.error("❌ OTP Error:", err);
     res.status(500).json({
@@ -398,35 +398,35 @@ app.post('/register', async (req, res) => {
 app.post('/company-register', async (req, res) => {
   try {
     const { firstName, lastName, email, mobile, password } = req.body;
- 
+
     if (!email || !password) {
       return res.status(400).json({
         success: false,
         error: 'Email and password required'
       });
     }
- 
+
     // 🔍 Check if email already exists
     const [existing] = await db
       .promise()
       .query('SELECT id FROM users WHERE email = ?', [email]);
- 
+
     if (existing.length > 0) {
       return res.status(409).json({
         success: false,
         error: 'User already registered. Please login.'
       });
     }
- 
+
     // 🔐 Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
- 
+
     // ✅ USE YOUR EXISTING ROLE DETECTOR
     const { role, company_name } = detectRoleAndCompany(email);
- 
+
     // 🔥 STATUS RULE (THIS IS NEW)
     const status = role === 'employee' ? 'PENDING' : 'ACTIVE';
- 
+
     // 💾 INSERT USER
     await db.promise().query(
       `INSERT INTO users
@@ -443,23 +443,23 @@ app.post('/company-register', async (req, res) => {
         status
       ]
     );
- 
+
     // 📧 SEND APPROVAL EMAIL ONLY FOR EMPLOYEE
     if (role === 'employee') {
       const [managers] = await db.promise().query(
         `SELECT email FROM users WHERE role = 'manager' AND company_name = ?`,
         [company_name]
       );
- 
+
       if (managers.length > 0) {
         const approveToken = jwt.sign(
           { email, company_name },
           secret_key,
           { expiresIn: '48h' }
         );
- 
+
         const approveLink = `http://localhost:5000/approve-employee?token=${approveToken}`;
- 
+
         await transporter.sendMail({
           to: managers[0].email,
           subject: 'Employee Approval Required',
@@ -472,7 +472,7 @@ app.post('/company-register', async (req, res) => {
         });
       }
     }
- 
+
     res.json({
       success: true,
       message:
@@ -482,10 +482,10 @@ app.post('/company-register', async (req, res) => {
       role,
       status
     });
- 
+
   } catch (err) {
     console.error('❌ Company Register Error:', err);
- 
+
     return res.status(500).json({
       success: false,
       error: 'Internal Server Error'
@@ -2324,241 +2324,216 @@ app.put('/change-mobile', async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
-
 // =============================
-// 🧠 NLP HELPERS
+// 🧠 NLP HELPER FUNCTIONS
 // =============================
-function extractTableNames(sql) {
-  const regex = /\bfrom\s+([a-zA-Z0-9_`]+)|\bjoin\s+([a-zA-Z0-9_`]+)/gi;
-  const tables = new Set();
-  let match;
 
-  while ((match = regex.exec(sql)) !== null) {
-    const table = (match[1] || match[2]).replace(/`/g, "");
-    tables.add(table);
-  }
-  return [...tables];
-}
-
-function normalizeSQL(sql) {
-  if (!sql) return "";
-  sql = sql.replace(/;\s*LIMIT/gi, " LIMIT");
-  sql = sql.replace(/;\s*$/g, "");
-  return sql.trim();
-}
-
-// =============================
-// 🧠 Allow ONLY Metric Questions
-// =============================
-function isAggregateOrMathQuestion(question) {
+function detectResultMode(question) {
   const q = question.toLowerCase();
 
-  const keywords = [
-    "total","sum","average","avg","mean",
-    "count","how many",
-    "minimum","min","maximum","max",
-    "percentage","percent","%",
-    "ratio","rate",
-    "difference","increase","decrease",
-    "growth","compare","vs","divided","per"
-  ];
+  if (
+    q.includes("separate") ||
+    q.includes("separately") ||
+    q.includes("individually") ||
+    q.includes("table wise")
+  ) {
+    return "separate";
+  }
 
-  return keywords.some(k => q.includes(k));
+  if (
+    q.includes("total") ||
+    q.includes("overall") ||
+    q.includes("combined") ||
+    q.includes("group")
+  ) {
+    return "combined";
+  }
+
+  return "auto";
 }
 
 // =============================
-// 🧠 NLQ → SQL → METRICS ONLY
+// 🧠 SAFE JSON PARSER
+// =============================
+function safeParseJSON(text) {
+  if (!text) return null;
+
+  const cleaned = text
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
+  return JSON.parse(cleaned);
+}
+
+// =============================
+// 🧠 NLP QUERY ROUTE
 // =============================
 app.post("/nlp/query", authenticateToken, async (req, res) => {
   try {
-    const { question, baseName } = req.body;
+    const { question, forceMode } = req.body;
 
-    if (!question || !baseName) {
-      return res.status(400).json({ error: "question and baseName are required" });
+    if (!question || typeof question !== "string") {
+      return res.status(400).json({ error: "Question required" });
     }
 
-    console.log("📦 DATASET:", baseName);
     console.log("🧠 QUESTION:", question);
 
-    // 🚫 Block non-metric questions
-    if (!isAggregateOrMathQuestion(question)) {
-      return res.status(400).json({
-        error: "Only aggregate and arithmetic questions are allowed",
-        examples: [
-          "total sales by region",
-          "average revenue",
-          "win percentage",
-          "sum of runs",
-          "highest score"
-        ]
-      });
+    // =============================
+    // 1️⃣ LOAD ONLY FULLTABLES
+    // =============================
+    const [tables] = await promiseDb.query("SHOW TABLES");
+
+    const fullTables = tables
+      .map(t => Object.values(t)[0])
+      .filter(name => name.endsWith("_fulltable"));
+
+    // =============================
+    // 2️⃣ MAP LOGICAL DATASETS
+    // =============================
+    const datasetMap = {};
+    // sales_data_2024 -> sales_data_2024_fulltable
+
+    for (const table of fullTables) {
+      const base = table.replace(/_fulltable$/, "");
+      datasetMap[base] = table;
     }
 
-    // =============================
-    // 1️⃣ Tables
-    // =============================
-    const tables = {
-      entity: `${baseName}_entity`,
-      metrics: `${baseName}_metrics`,
-      dimension: `${baseName}_dimension`,
-    };
+    const logicalDatasets = Object.keys(datasetMap);
 
     // =============================
-    // 2️⃣ Validate tables
+    // 3️⃣ FILTER DATASETS BY QUESTION
     // =============================
-    for (const t in tables) {
-      try {
-        await promiseDb.query(`SELECT 1 FROM \`${tables[t]}\` LIMIT 1`);
-      } catch {
-        tables[t] = null;
-      }
+    const qLower = question.toLowerCase();
+
+    const matchedDatasets = logicalDatasets.filter(ds => {
+      const base = ds.replace(/_\d+$/, "");
+      return qLower.includes(base) || qLower.includes(ds);
+    });
+
+    const datasetsUsed =
+      matchedDatasets.length > 0 ? matchedDatasets : logicalDatasets;
+
+    const mode = forceMode || detectResultMode(question);
+
+    console.log("🧭 MODE:", mode);
+    console.log("📦 DATASETS USED:", datasetsUsed);
+
+    // =============================
+    // 4️⃣ BUILD AI PROMPT
+    // =============================
+    const prompt = `
+You are a senior MySQL data analyst.
+
+RULES:
+- Use ONLY the tables listed below
+- Tables are FULLTABLES (raw data)
+- NEVER invent tables or columns
+- Return ONLY JSON
+
+TABLES:
+${datasetsUsed.map(ds => `Table: ${datasetMap[ds]}`).join("\n")}
+
+If mode is:
+- combined → aggregate across all tables
+- separate → one query per table
+
+RETURN FORMAT:
+{
+  "mode": "combined | separate",
+  "queries": [
+    {
+      "dataset": "dataset_name",
+      "sql": "SELECT ..."
     }
+  ]
+}
 
-    if (!tables.entity && !tables.metrics && !tables.dimension) {
-      return res.status(400).json({ error: "No processed tables found" });
-    }
-
-    // =============================
-    // 3️⃣ Fetch columns
-    // =============================
-    const allColumns = {};
-    const columnMap = {};
-
-    for (const t in tables) {
-      if (!tables[t]) continue;
-
-      const [cols] = await promiseDb.query(`SHOW COLUMNS FROM \`${tables[t]}\``);
-      allColumns[t] = cols.map(c => c.Field);
-
-      cols.forEach(c => {
-        columnMap[c.Field.toLowerCase()] = tables[t];
-      });
-    }
-
-    // =============================
-    // 4️⃣ Detect columns from question
-    // =============================
-    const questionLower = question.toLowerCase();
-
-    const requiredColumns = Object.keys(columnMap).filter(col =>
-      questionLower.includes(col.replace("_"," "))
-    );
-
-    const requiredTables = new Set();
-    requiredColumns.forEach(c => requiredTables.add(columnMap[c]));
-
-    // =============================
-    // 5️⃣ Enforce joins
-    // =============================
-    let enforcedJoin = "";
-
-    if (requiredTables.has(tables.entity) && requiredTables.has(tables.dimension)) {
-      enforcedJoin = `JOIN ${tables.dimension} dd ON de.auto_id = dd.auto_id`;
-    }
-
-    // =============================
-    // 6️⃣ LLM Prompt (Metrics Only)
-    // =============================
-    let prompt = "You are a strict MySQL analytics SQL generator.\n\n";
-
-    for (const t in allColumns) {
-      prompt += `Table: ${tables[t]}\n`;
-      prompt += `Columns: ${allColumns[t].join(", ")}\n\n`;
-    }
-
-    prompt += `
-STRICT RULES:
-- You MUST use SUM, AVG, COUNT, MIN or MAX
-- You MAY use + - * / % on aggregated values
-- NEVER return row level data
-- NEVER use SELECT *
-- NEVER select raw columns without aggregation
-- Use ONLY tables above
-- ${tables.entity} must be de
-- ${tables.metrics} must be dm
-- ${tables.dimension} must be dd
-- Join ONLY on auto_id
-- DO NOT use LIMIT
-- Return ONLY SQL
-
-JOIN TO USE:
-FROM ${tables.entity} de
-${enforcedJoin}
-
-User Question: "${question}"
+User Question:
+"${question}"
 `;
 
     // =============================
-    // 7️⃣ Call OpenAI
+    // 5️⃣ OPENAI CALL
     // =============================
     const aiRes = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [{ role: "user", content: prompt }],
       temperature: 0,
+      response_format: { type: "json_object" }
     });
 
-    let sql = aiRes.choices[0].message.content
-      .replace(/```sql|```/gi, "")
-      .trim();
+    const aiJson = safeParseJSON(aiRes.choices[0].message.content);
 
-    // =============================
-    // 8️⃣ Safety Check
-    // =============================
-    sql = normalizeSQL(sql);
-    const lowerSql = sql.toLowerCase();
-
-    const forbidden = ["drop","delete","update","insert","alter","truncate"];
-    if (!lowerSql.startsWith("select") || forbidden.some(w => lowerSql.includes(w))) {
-      return res.status(400).json({ error: "Unsafe SQL", sql });
-    }
-
-    const isAgg = ["sum(","avg(","count(","min(","max("].some(f => lowerSql.includes(f));
-
-    // 🚫 Block non-aggregate SQL
-    if (!isAgg) {
+    if (!aiJson || !Array.isArray(aiJson.queries)) {
       return res.status(400).json({
-        error: "Only aggregate or arithmetic SQL allowed",
-        sql
+        error: "Invalid AI response",
+        raw: aiRes.choices[0].message.content
       });
     }
 
     // =============================
-    // 9️⃣ Validate tables used
+    // 6️⃣ EXECUTE SQL (ALWAYS PER TABLE FIRST)
     // =============================
-    const allowedTables = Object.values(tables).filter(Boolean);
-    const usedTables = extractTableNames(sql);
+    const perTableResults = {};
 
-    const invalidTables = usedTables.filter(t => !allowedTables.includes(t));
-    if (invalidTables.length > 0) {
-      return res.status(400).json({
-        error: "Invalid tables used",
-        invalidTables,
-        allowedTables,
-        sql
+    for (const q of aiJson.queries) {
+      const sql = q.sql.trim();
+
+      if (!sql.toLowerCase().startsWith("select")) {
+        return res.status(400).json({ error: "Unsafe SQL", sql });
+      }
+
+      console.log("🧠 EXECUTING:", sql);
+
+      const [rows] = await promiseDb.query(sql);
+      perTableResults[q.dataset] = rows;
+    }
+
+    // =============================
+    // 7️⃣ POPUP DECISION (CLEAN NAMES ONLY)
+    // =============================
+    const tablesWithData = Object.entries(perTableResults)
+      .filter(([_, rows]) => Array.isArray(rows) && rows.length > 0)
+      .map(([dataset]) => dataset.replace(/_fulltable$/, "")); // 🔥 ONLY CHANGE
+
+    if (tablesWithData.length > 1 && !forceMode) {
+      return res.json({
+        needsUserChoice: true,
+        datasets: tablesWithData
       });
     }
 
-    console.log("🧠 FINAL SQL:", sql);
+    // =============================
+    // 8️⃣ FINAL RESULT (USER WINS)
+    // =============================
+    const finalMode = forceMode || aiJson.mode;
 
-    // =============================
-    // 🔟 Execute
-    // =============================
-    const [result] = await promiseDb.query(sql);
+    let results = {};
+
+    if (finalMode === "combined") {
+      let combinedRows = [];
+
+      for (const rows of Object.values(perTableResults)) {
+        combinedRows = combinedRows.concat(rows);
+      }
+
+      results["combined_result"] = combinedRows;
+    } else {
+      results = perTableResults;
+    }
 
     res.json({
       success: true,
-      baseName,
-      sql,
-      result,
-      message: result.length === 0 ? "No data found" : undefined
+      mode: finalMode,
+      results
     });
 
   } catch (err) {
     console.error("❌ NLP ERROR:", err);
-    res.status(500).json({ error: " Currently working is progress" });
+    res.status(500).json({ error: "NLP query failed" });
   }
 });
-
 
 
 // =============================
