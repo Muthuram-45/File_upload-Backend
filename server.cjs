@@ -1043,7 +1043,6 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
-
 app.get("/fetch-api", authenticateToken, async (req, res) => {
   try {
     if (req.user.viewOnly) {
@@ -1234,11 +1233,19 @@ cron.schedule("*/5 * * * *", async () => {
         api_url,
         response_hash,
         api_token,
-        last_processed_at
+        last_processed_at,
+        status
       FROM api_data
+      WHERE status != 'PROCESSING'
     `);
 
     for (const api of apis) {
+
+      // ⛔ Extra safety (double-check)
+      if (api.status === "PROCESSING") {
+        continue;
+      }
+
       const now = new Date();
       const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
 
@@ -1305,27 +1312,6 @@ cron.schedule("*/5 * * * *", async () => {
   }
 });
 
-
-// --------------------------------------------------------
-// 🔍 API to check duplicate file name
-// --------------------------------------------------------
-// app.get("/check-filename", (req, res) => {
-//   const fileName = req.query.name;
-
-//   db.query(
-//     "SELECT id FROM api_data WHERE file_name = ?",
-//     [fileName],
-//     (err, result) => {
-//       if (err) return res.json({ exists: false });
-
-//       if (result.length > 0) {
-//         res.json({ exists: true });
-//       } else {
-//         res.json({ exists: false });
-//       }
-//     }
-//   );
-// });
 
 // --------------------------------------------------------
 // 💾 Utility: Flatten nested objects for CSV
@@ -1921,46 +1907,69 @@ app.get("/files", authenticateToken, async (req, res) => {
   }
 });
 
-
-
-// =============================
-// GET PROCESSED TABLE DATA (FIXED)
-// =============================
 app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
   try {
     const { tableName } = req.params;
-    const { company_name, viewOnly } = req.user;
+    const { id: userId, company_name, viewOnly } = req.user;
 
-    // ============================================
-    // 1️⃣ SECURITY: Allow only files belonging to company
-    // ============================================
-    const [files] = await db.promise().query(
-      `
-      SELECT file_name FROM files WHERE company_name = ?
-      UNION
-      SELECT file_name FROM api_data WHERE company_name = ?
-      `,
-      [company_name, company_name]
-    );
+    let filesQuery = "";
+    let queryParams = [];
 
+    // =============================
+    // 1️⃣ PERSONAL USER
+    // =============================
+    if (!company_name) {
+      filesQuery = `
+        SELECT file_name FROM files WHERE uploaded_by = ?
+        UNION
+        SELECT file_name FROM api_data WHERE uploaded_by = ?
+      `;
+      queryParams = [userId, userId];
+    }
+    // =============================
+    // 2️⃣ COMPANY USER
+    // =============================
+    else {
+      filesQuery = `
+        SELECT file_name FROM files WHERE company_name = ?
+        UNION
+        SELECT file_name FROM api_data WHERE company_name = ?
+      `;
+      queryParams = [company_name, company_name];
+    }
+
+    const [files] = await db.promise().query(filesQuery, queryParams);
+
+    // =============================
+    // 3️⃣ Normalize filenames
+    // =============================
     const allowedBaseNames = files
       .filter(f => f.file_name)
-      .map(f => f.file_name.toLowerCase().replace(/\.[^/.]+$/, ""));
+      .map(f =>
+        f.file_name
+          .toLowerCase()
+          .replace(/\.[^/.]+$/, "")
+          .replace(/\s+/g, "_")
+      );
 
     const baseName = tableName
       .toLowerCase()
-      .replace(/_(fulltable|entity|metrics|dimension)$/, "");
+      .replace(/_(fulltable|entity|metrics|dimension)$/, "")
+      .replace(/\s+/g, "_");
 
+    // =============================
+    // 4️⃣ Access check
+    // =============================
     if (!allowedBaseNames.includes(baseName)) {
       return res.status(403).json({
         success: false,
-        error: "Access denied for this table"
+        error: "You don't have access to this file"
       });
     }
 
-    // ============================================
-    // 2️⃣ HARD RULE: Spark table must exist
-    // ============================================
+    // =============================
+    // 5️⃣ Spark table exists?
+    // =============================
     const [[exists]] = await db.promise().query(
       `
       SELECT COUNT(*) AS count
@@ -1971,21 +1980,19 @@ app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
       [tableName]
     );
 
-    // 🔥 If Spark has not created this table yet
     if (exists.count === 0) {
       return res.json({
         success: true,
         tableName,
-        rows: [],               // ❌ No raw JSON allowed
-        status: "WAITING",      // frontend can show spinner
-        message: "Waiting for PySpark processing",
+        rows: [],
+        status: "WAITING",
         viewOnly: !!viewOnly
       });
     }
 
-    // ============================================
-    // 3️⃣ Fetch Spark processed table
-    // ============================================
+    // =============================
+    // 6️⃣ Fetch processed data
+    // =============================
     const [rows] = await db.promise().query(
       `SELECT * FROM \`${tableName}\``
     );
@@ -2006,7 +2013,6 @@ app.get("/processed-table/:tableName", authenticateToken, async (req, res) => {
     });
   }
 });
-
 
 
 app.get("/dashboard-counts", authenticateToken, async (req, res) => {
