@@ -2334,6 +2334,14 @@ app.put('/change-mobile', async (req, res) => {
 // 🧠 NLP HELPER FUNCTIONS
 // =============================
 
+async function getTableColumns(tableName) {
+  const [rows] = await promiseDb.query(
+    `SHOW COLUMNS FROM \`${tableName}\``
+  );
+  return rows.map(r => r.Field);
+}
+
+
 function detectResultMode(question) {
   const q = question.toLowerCase();
 
@@ -2425,28 +2433,45 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
     console.log("🧭 MODE:", mode);
     console.log("📦 DATASETS USED:", datasetsUsed);
 
+    const schemaInfo = {};
+
+    for (const ds of datasetsUsed) {
+      const tableName = datasetMap[ds];
+      schemaInfo[tableName] = await getTableColumns(tableName);
+    }
+
     // =============================
     // 4️⃣ BUILD AI PROMPT
     // =============================
     const prompt = `
 You are a senior MySQL data analyst.
 
-RULES:
-- Use ONLY the tables listed below
+STRICT RULES:
+- Use ONLY the tables AND columns listed below
 - Tables are FULLTABLES (raw data)
-- NEVER invent tables or columns
-- Return ONLY JSON
+- NEVER invent table names or column names
+- Choose the MOST RELEVANT column based on the question meaning
+- If an exact column does not exist, infer using the closest matching column
+- If a "name" column does not exist, use an ID or descriptive column instead
+- Return ONLY valid JSON (no explanation)
 
-TABLES:
-${datasetsUsed.map(ds => `Table: ${datasetMap[ds]}`).join("\n")}
+SCHEMA:
+${datasetsUsed
+        .map(ds => {
+          const table = datasetMap[ds];
+          const cols = schemaInfo[table].join(", ");
+          return `Table: ${table}\nColumns: ${cols}`;
+        })
+        .join("\n\n")}
 
-If mode is:
+MODE RULES:
 - combined → aggregate across all tables
 - separate → one query per table
+- auto → choose best mode based on the question
 
 RETURN FORMAT:
 {
-  "mode": "combined | separate",
+  "mode": "combined | separate | auto",
   "queries": [
     {
       "dataset": "dataset_name",
@@ -2458,6 +2483,7 @@ RETURN FORMAT:
 User Question:
 "${question}"
 `;
+
 
     // =============================
     // 5️⃣ OPENAI CALL
