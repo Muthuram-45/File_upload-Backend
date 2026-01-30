@@ -17,6 +17,7 @@ const readCSV = require("./utils/readCSV.cjs")
 const { CohereClient } = require("cohere-ai");
 const cron = require("node-cron");
 const crypto = require("crypto");
+const PDFDocument = require("pdfkit");
 
 
 const app = express();
@@ -45,11 +46,39 @@ function sortObject(obj) {
 }
 
 
-// CommonJS require
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// FOR Files_run_Stats
 
+async function insertFileRunStat({
+  file_name,
+  company_name,
+  uploaded_by,
+  rows_count = 0,
+  status = "DONE"
+}) {
+  await db.promise().query(`
+    INSERT INTO file_run_stats
+    (file_name, company_name, uploaded_by,
+     processed_at, rows_count, status)
+    VALUES (?, ?, ?, NOW(), ?, ?)
+  `, [
+    file_name,
+    company_name,
+    uploaded_by,
+    rows_count,
+    status
+  ]);
+}
+
+
+
+// CommonJS require
+// const client = new OpenAI({
+//   apiKey: process.env.OPENAI_API_KEY,
+// });
+
+// CommonJS require for GROQAI
+
+const GROQ_KEY = process.env.GROQ_API_KEY;
 
 // ✅ JWT Secret Key
 const secret_key = 'f8a0c1b6d2e9-42ad-9a3f-57b4a0c9e2f'; // 🔥 Add this line
@@ -1075,37 +1104,19 @@ app.get("/fetch-api", authenticateToken, async (req, res) => {
 app.post("/fetch-api", authenticateToken, async (req, res) => {
   try {
     if (req.user.viewOnly) {
-      return res.status(403).json({
-        success: false,
-        error: "View-only access. Fetch API disabled."
-      });
+      return res.status(403).json({ error: "View-only access" });
     }
 
     const { url, file_name } = req.body;
     if (!url || !file_name) {
-      return res.status(400).json({
-        success: false,
-        error: "API URL and File Name are required"
-      });
+      return res.status(400).json({ error: "API URL and File Name required" });
     }
 
-    const externalToken =
-      req.headers["x-api-key"] || req.headers["authorization-external"];
-
-    const headers = {};
-    if (externalToken) {
-      headers.Authorization = externalToken.startsWith("Bearer")
-        ? externalToken
-        : `Bearer ${externalToken}`;
-    }
-
-    const apiResponse = await axios.get(url, { headers });
-
+    const apiResponse = await axios.get(url);
     const raw = Array.isArray(apiResponse.data)
       ? apiResponse.data
       : [apiResponse.data];
 
-    // 🔥 Use same hashing as cron
     const hash = stableHash(raw);
 
     const companyName = req.user.company_name || null;
@@ -1120,40 +1131,60 @@ app.post("/fetch-api", authenticateToken, async (req, res) => {
       .replace(/[^a-z0-9_]/g, "");
 
     const [existing] = await db.promise().query(
-      `SELECT id FROM api_data WHERE file_name = ? AND company_name <=> ?`,
+      `SELECT id, response_hash FROM api_data
+       WHERE file_name = ? AND company_name <=> ?`,
       [safeName, companyName]
     );
 
+    let status = "DONE";
+
+    if (existing.length === 0 || existing[0].response_hash !== hash) {
+      status = "NEW";
+    }
+
     if (existing.length === 0) {
-      // 🆕 insert
       await db.promise().query(
         `INSERT INTO api_data
-         (api_url, file_name, response, response_hash, company_name, uploaded_by,
+         (api_url, file_name, response, response_hash,
+          company_name, uploaded_by,
           status, last_processed_at, next_process_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?)`,
-        [url, safeName, JSON.stringify(raw), hash, companyName, uploadedBy, now, nextRun]
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          url,
+          safeName,
+          JSON.stringify(raw),
+          hash,
+          companyName,
+          uploadedBy,
+          "NEW",
+          now,
+          nextRun
+        ]
       );
     } else {
-      // ♻️ update → always mark NEW (cron will decide DONE later)
       await db.promise().query(
         `UPDATE api_data
-         SET api_url = ?,
-             response = ?,
-             response_hash = ?,
-             status = 'NEW',
-             last_processed_at = ?,
-             next_process_at = ?
+         SET response = ?, response_hash = ?, status = ?,
+             last_processed_at = ?, next_process_at = ?
          WHERE id = ?`,
-        [url, JSON.stringify(raw), hash, now, nextRun, existing[0].id]
+        [
+          JSON.stringify(raw),
+          hash,
+          status,
+          now,
+          nextRun,
+          existing[0].id
+        ]
       );
     }
 
-    res.json({ success: true, data: raw });
+    res.json({ success: true, status });
+
   } catch (err) {
-    console.error("❌ Fetch API Error:", err.message);
-    res.status(500).json({ success: false, error: "Fetch failed" });
+    res.status(500).json({ error: "Fetch failed" });
   }
 });
+
 app.post("/save-api-data", authenticateToken, async (req, res) => {
   try {
     if (req.user.viewOnly) {
@@ -1221,37 +1252,33 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Save failed" });
   }
 });
-
-
-cron.schedule("*/5 * * * *", async () => {
-  console.log("⏰ API cron started (every 5 minutes)");
+// =======================================================
+// ⏰ API CRON – FINAL & CORRECT
+// =======================================================
+cron.schedule("0 * * * *", async () => {
+  console.log("⏰ API cron started (every 2 minutes)");
 
   try {
     const [apis] = await db.promise().query(`
-      SELECT 
+      SELECT
         id,
         api_url,
+        response,
         response_hash,
         api_token,
-        last_processed_at,
-        status
+        file_name,
+        company_name,
+        uploaded_by
       FROM api_data
-      WHERE status != 'PROCESSING'
     `);
 
     for (const api of apis) {
-
-      // ⛔ Extra safety (double-check)
-      if (api.status === "PROCESSING") {
-        continue;
-      }
-
       const now = new Date();
-      const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
+      const nextRun = new Date(now.getTime() + 60 * 60 * 1000);
 
       try {
+        // 1️⃣ FETCH API
         const headers = { "User-Agent": "Cloud360-Cron/1.0" };
-
         if (api.api_token) {
           headers.Authorization = api.api_token.startsWith("Bearer ")
             ? api.api_token
@@ -1259,24 +1286,38 @@ cron.schedule("*/5 * * * *", async () => {
         }
 
         const res = await axios.get(api.api_url, {
-          timeout: 15000,
-          headers,
+          timeout: 20000,
+          headers
         });
 
         const rawNewData = Array.isArray(res.data)
           ? res.data
           : [res.data];
 
-        // 🔥 Stable hash of raw response
+        // 2️⃣ HASH = ONLY SOURCE OF TRUTH
         const newHash = stableHash(rawNewData);
-        const oldHash = api.response_hash || null;
+        const oldHash = api.response_hash;
 
-        const isNewData = newHash !== oldHash;
-        const status = isNewData ? "NEW" : "DONE";
-        const lastProcessedAt = isNewData ? now : api.last_processed_at;
+        const isUpdated = newHash !== oldHash;
 
-        await db.promise().query(
-          `
+        // 3️⃣ ROW COUNTS (REPORTING ONLY)
+        let prevRows = 0;
+        try {
+          const oldData = api.response ? JSON.parse(api.response) : [];
+          prevRows = Array.isArray(oldData) ? oldData.length : 0;
+        } catch { }
+
+        const currRows = rawNewData.length;
+        const newRows = isUpdated
+          ? Math.max(currRows - prevRows, 0)
+          : 0;
+
+        // 4️⃣ STATUS DECISION
+        const apiDataStatus = isUpdated ? "NEW" : "DONE";
+        const runStatus = isUpdated ? "UPDATED" : "NO_CHANGE";
+
+        // 5️⃣ UPDATE api_data (LATEST SNAPSHOT)
+        await db.promise().query(`
           UPDATE api_data
           SET
             response = ?,
@@ -1285,32 +1326,316 @@ cron.schedule("*/5 * * * *", async () => {
             last_processed_at = ?,
             next_process_at = ?
           WHERE id = ?
-          `,
-          [
-            JSON.stringify(rawNewData),
-            newHash,
-            status,
-            lastProcessedAt,
-            nextRun,
-            api.id,
-          ]
-        );
+        `, [
+          JSON.stringify(rawNewData),
+          newHash,
+          apiDataStatus,
+          now,
+          nextRun,
+          api.id
+        ]);
 
-        console.log(`✔ ${api.api_url} → ${status}`);
+        // 6️⃣ INSERT api_run_stats (ALWAYS)
+        await db.promise().query(`
+          INSERT INTO api_run_stats
+          (
+            api_id,
+            api_name,
+            company_name,
+            uploaded_by,
+            run_time,
+            prev_rows,
+            curr_rows,
+            new_rows,
+            duplicates_removed,
+            status
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          api.id,
+          api.file_name,
+          api.company_name,
+          api.uploaded_by,
+          now,
+          prevRows,
+          currRows,
+          newRows,
+          0,
+          runStatus
+        ]);
 
-      } catch (apiErr) {
-        console.error("❌ API fetch failed:", api.api_url, apiErr.message);
+        console.log(`✔ API ${api.file_name} → ${runStatus}`);
 
-        await db.promise().query(
-          `UPDATE api_data SET next_process_at = ? WHERE id = ?`,
-          [nextRun, api.id]
-        );
+      } catch (err) {
+        console.error("❌ API fetch failed:", api.api_url, err.message);
       }
     }
+
   } catch (err) {
     console.error("❌ Cron fatal error:", err.message);
   }
 });
+// =======================================================
+// 📧 DAILY SUMMARY MAIL CRON (FILES + API TABLE + API UPDATES)
+// =======================================================
+cron.schedule("30 0 * * *", async () => {
+  console.log("📧 Daily Summary Mail Cron Started");
+
+  const [users] = await db.promise().query(`
+    SELECT id, email, role, company_name
+    FROM users
+    WHERE status = 'ACTIVE'
+  `);
+
+  for (const user of users) {
+
+    // ===================================================
+    // 📁 FILE SUMMARY (TODAY)
+    // ===================================================
+    const [files] = await db.promise().query(`
+      SELECT
+        file_name,
+        status,
+        rows_count,
+        processed_at
+      FROM file_run_stats
+      WHERE
+        (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
+        AND DATE(processed_at) = CURDATE()
+      ORDER BY processed_at DESC
+    `, [user.company_name || user.id]);
+
+    // ===================================================
+    // 🌐 API SUMMARY (AGGREGATED – TODAY)
+    // ===================================================
+    const [apis] = await db.promise().query(`
+      SELECT
+        api_name,
+        COUNT(*) AS total_runs,
+        SUM(new_rows) AS total_new_rows,
+        MAX(run_time) AS last_run,
+        CASE
+          WHEN SUM(new_rows) > 0 THEN 'UPDATED'
+          ELSE 'NO_CHANGE'
+        END AS status
+      FROM api_run_stats
+      WHERE
+        (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
+        AND DATE(run_time) = CURDATE()
+      GROUP BY api_name
+      ORDER BY api_name
+    `, [user.company_name || user.id]);
+
+    // ===================================================
+    // 🌐 API UPDATE DETAILS (ONLY WHEN DATA CHANGED)
+    // ===================================================
+    const [apiChanges] = await db.promise().query(`
+      SELECT
+        api_name,
+        run_time,
+        new_rows
+      FROM api_run_stats
+      WHERE
+        (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
+        AND DATE(run_time) = CURDATE()
+        AND new_rows > 0
+      ORDER BY api_name, run_time
+    `, [user.company_name || user.id]);
+
+    if (!files.length && !apis.length && !apiChanges.length) continue;
+
+    const html = buildDailySummaryEmail(
+      user,
+      files,
+      apis,
+      apiChanges
+    );
+
+    await transporter.sendMail({
+      to: user.email,
+      subject: "📊 Cloud360 Daily Data Summary",
+      html
+    });
+  }
+});
+
+
+// =======================================================
+// ✉️ EMAIL TEMPLATE
+// =======================================================
+function buildDailySummaryEmail(user, files, apis, apiChanges) {
+
+  const today = new Date().toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric"
+  });
+
+  // -------------------------------
+  // GROUP API CHANGES BY API NAME
+  // -------------------------------
+  const groupedApiChanges = {};
+  (apiChanges || []).forEach(r => {
+    if (!groupedApiChanges[r.api_name]) {
+      groupedApiChanges[r.api_name] = [];
+    }
+    groupedApiChanges[r.api_name].push(r);
+  });
+
+  return `
+  <h2>📊 Cloud360 Daily Summary</h2>
+
+  <p>
+    <b>Date:</b> ${today}<br/>
+    <b>User:</b> ${user.email}<br/>
+    <b>Role:</b> ${user.role}
+  </p>
+
+  <hr/>
+
+  <!-- ================= FILES ================= -->
+ <h3 style="margin-top:10px;">📁 Uploaded Files</h3>
+
+<table width="100%" cellpadding="0" cellspacing="0"
+  style="
+    border-collapse:collapse;
+    table-layout:fixed;
+    font-size:13px;
+  ">
+  <thead>
+    <tr style="background:#f4f6f8;">
+      <th style="width:40%;border:1px solid #ddd;padding:6px;text-align:center;">File</th>
+      <th style="width:15%;border:1px solid #ddd;padding:6px;text-align:center;">Status</th>
+      <th style="width:15%;border:1px solid #ddd;padding:6px;text-align:center;">Rows</th>
+      <th style="width:30%;border:1px solid #ddd;padding:6px;text-align:center;">Processed At</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${files.length
+      ? files.map(f => `
+          <tr>
+            <td style="border:1px solid #ddd;padding:6px;word-break:break-word;text-align:center;">
+              ${f.file_name}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+              ${f.status}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+              ${f.rows_count ?? "—"}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+  ${f.processed_at
+          ? new Date(f.processed_at).toLocaleString("en-IN", {
+            day: "2-digit",
+            month: "short",
+            year: "numeric",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: true
+          })
+          : "—"
+        }
+</td>
+
+          </tr>
+        `).join("")
+      : `<tr>
+            <td colspan="4" style="border:1px solid #ddd;padding:8px;text-align:center;">
+              No file activity today
+            </td>
+          </tr>`
+    }
+  </tbody>
+</table>
+
+
+  <br/>
+
+  <!-- ================= API TABLE ================= -->
+ <h3 style="margin-top:16px;">🌐 API Summary (Today)</h3>
+
+<table width="100%" cellpadding="0" cellspacing="0"
+  style="
+    border-collapse:collapse;
+    table-layout:fixed;
+    font-size:13px;
+  ">
+  <thead>
+    <tr style="background:#f4f6f8;">
+      <th style="width:35%;border:1px solid #ddd;padding:6px;text-align:center;">API Name</th>
+      <th style="width:20%;border:1px solid #ddd;padding:6px;text-align:center;">Status</th>
+      <th style="width:20%;border:1px solid #ddd;padding:6px;text-align:center;">Total Batch Process (24 hrs)</th>
+      <th style="width:25%;border:1px solid #ddd;padding:6px;text-align:center;">Last Processed Time</th>
+    </tr>
+  </thead>
+  <tbody>
+    ${apis.length
+      ? apis.map(a => `
+          <tr>
+            <td style="border:1px solid #ddd;padding:6px;word-break:break-word;text-align:center;">
+              ${a.api_name}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+              ${a.status === "UPDATED" ? "🟢 UPDATED" : "⚪ NO CHANGE"}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+              ${a.total_runs}
+            </td>
+            <td style="border:1px solid #ddd;padding:6px;text-align:center;">
+              ${new Date(a.last_run).toLocaleTimeString("en-IN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true
+      })}
+            </td>
+          </tr>
+        `).join("")
+      : `<tr>
+            <td colspan="4" style="border:1px solid #ddd;padding:8px;text-align:center;">
+              No API activity today
+            </td>
+          </tr>`
+    }
+  </tbody>
+</table>
+
+
+  <br/>
+
+  <!-- ================= API UPDATES ================= -->
+  <h3>🌐 API Updates (Only Changed)</h3>
+
+  ${Object.keys(groupedApiChanges).length
+      ? Object.entries(groupedApiChanges).map(([api, runs]) => `
+        <p><b>🟢 ${api}</b></p>
+        <ul>
+          ${runs.map(r => `
+            <li>
+  ${new Date(r.run_time).toLocaleTimeString("en-IN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true
+      })}
+  → ${r.status === "UPDATED" ? "🟢 UPDATED" : "⚪ NO CHANGE"}
+</li>
+
+          `).join("")}
+        </ul>
+      `).join("")
+      : `<p>No API updates today</p>`
+    }
+
+  <br/>
+
+  <p>
+    👉 <a href="http://localhost:5173/dashboard">Open Dashboard</a>
+  </p>
+
+  <small>
+    This is an automated report generated by Cloud360.
+  </small>
+  `;
+}
 
 
 // --------------------------------------------------------
@@ -1328,158 +1653,6 @@ const flattenObject = (obj, prefix = '') =>
     }
     return acc;
   }, {});
-
-// // --------------------------------------------------------
-// // 💾 Save API data (CSV + DB)
-// // --------------------------------------------------------
-// app.post("/save-api-data", authenticateToken, (req, res) => {
-//   if (req.user.viewOnly) {
-//     return res.status(403).json({
-//       success: false,
-//       error: "View-only users cannot save API data"
-//     });
-//   }
-//   const { api_url, file_name, response } = req.body;
-
-//   // 🔥 From token
-//   const uploadedBy = req.user.id;
-//   const company_name = req.user.company_name || null;
-
-//   if (!response) {
-//     return res.status(400).json({
-//       success: false,
-//       message: "Response is empty",
-//     });
-//   }
-
-//   let jsonData;
-//   try {
-//     jsonData = typeof response === "string"
-//       ? JSON.parse(response)
-//       : response;
-//   } catch {
-//     return res.status(400).json({
-//       success: false,
-//       message: "Invalid JSON",
-//     });
-//   }
-
-//   if (!Array.isArray(jsonData)) {
-//     jsonData = [jsonData];
-//   }
-
-//   // -----------------------------
-//   // Flatten JSON
-//   // -----------------------------
-//   const flatData = [];
-
-//   jsonData.forEach(item => {
-//     const arrayKeys = Object.keys(item).filter(
-//       key => Array.isArray(item[key])
-//     );
-
-//     if (arrayKeys.length) {
-//       arrayKeys.forEach(arrKey => {
-//         item[arrKey].forEach(subItem => {
-//           flatData.push(
-//             flattenObject({
-//               ...item,
-//               [arrKey]: undefined,
-//               ...subItem
-//             })
-//           );
-//         });
-//       });
-//     } else {
-//       flatData.push(flattenObject(item));
-//     }
-//   });
-
-//   if (!flatData.length) {
-//     return res.status(400).json({
-//       success: false,
-//       message: "No data to save",
-//     });
-//   }
-
-//   // -----------------------------
-//   // JSON → CSV
-//   // -----------------------------
-//   let csv;
-//   try {
-//     const fields = Object.keys(flatData[0]);
-//     const parser = new Parser({ fields });
-//     csv = parser.parse(flatData);
-//   } catch (err) {
-//     console.error("CSV Parse Error:", err);
-//     return res.status(500).json({
-//       success: false,
-//       message: "Failed to convert JSON to CSV",
-//     });
-//   }
-
-//   // -----------------------------
-//   // ✅ SAFE FILE NAME (NEW)
-//   // -----------------------------
-//   const safeName = file_name
-//     .trim()
-//     .toLowerCase()
-//     .replace(/\s+/g, "_")
-//     .replace(/[^a-z0-9_]/g, "");
-
-//   const relativePath = `uploads/API_Files/${safeName}.csv`;
-//   const fullPath = path.join(__dirname, relativePath);
-
-//   // -----------------------------
-//   // Save CSV file
-//   // -----------------------------
-//   try {
-//     fs.writeFileSync(fullPath, csv);
-//   } catch (err) {
-//     console.error("File Save Error:", err);
-//     return res.status(500).json({
-//       success: false,
-//       message: "Failed to save CSV file",
-//     });
-//   }
-
-//   // -----------------------------
-//   // Save DB record (FIXED)
-//   // -----------------------------
-//   const sql = `
-//     INSERT INTO api_data
-//       (api_url, file_name, file_path, response, company_name, uploaded_by)
-//     VALUES (?, ?, ?, ?, ?, ?)
-//   `;
-
-//   db.query(
-//     sql,
-//     [
-//       api_url,
-//       safeName,
-//       relativePath,
-//       JSON.stringify(jsonData), // ✅ FIXED
-//       company_name,
-//       uploadedBy,
-//     ],
-//     (err) => {
-//       if (err) {
-//         console.error("DB Error:", err);
-//         return res.status(500).json({
-//           success: false,
-//           message: "DB Error",
-//         });
-//       }
-
-//       res.json({
-//         success: true,
-//         message: "API Data saved successfully!",
-//         file_path: relativePath,
-//       });
-//     }
-//   );
-// });
-
 
 
 // ======================
@@ -2380,8 +2553,10 @@ function safeParseJSON(text) {
   return JSON.parse(cleaned);
 }
 
+
+
 // =============================
-// 🧠 NLP QUERY ROUTE
+// 🧠 NLP QUERY ROUTE (SECURE)
 // =============================
 app.post("/nlp/query", authenticateToken, async (req, res) => {
   try {
@@ -2391,23 +2566,83 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Question required" });
     }
 
+    const { id: userId, company_name } = req.user;
+
     console.log("🧠 QUESTION:", question);
 
-    // =============================
-    // 1️⃣ LOAD ONLY FULLTABLES
-    // =============================
+    // =====================================================
+    // 🔐 1️⃣ FETCH ALLOWED DATASETS (FILES + API)
+    // =====================================================
+    let allowedQuery = "";
+    let params = [];
+
+    // PERSONAL USER
+    if (!company_name) {
+      allowedQuery = `
+        SELECT file_name FROM files WHERE uploaded_by = ?
+        UNION
+        SELECT file_name FROM api_data WHERE uploaded_by = ?
+      `;
+      params = [userId, userId];
+    }
+    // COMPANY USER (EMPLOYEE / MANAGER)
+    else {
+      allowedQuery = `
+        SELECT file_name FROM files WHERE company_name = ?
+        UNION
+        SELECT file_name FROM api_data WHERE company_name = ?
+      `;
+      params = [company_name, company_name];
+    }
+
+    const [allowedFiles] = await promiseDb.query(allowedQuery, params);
+
+    const allowedBaseNames = new Set(
+      allowedFiles
+        .filter(r => r.file_name)
+        .map(r =>
+          r.file_name
+            .toLowerCase()
+            .replace(/\.[^/.]+$/, "")
+            .replace(/\s+/g, "_")
+        )
+    );
+
+    if (allowedBaseNames.size === 0) {
+      return res.json({
+        success: true,
+        mode: "auto",
+        results: {},
+        message: "No data available for NLP query"
+      });
+    }
+
+    // =====================================================
+    // 🔐 2️⃣ LOAD ONLY AUTHORIZED FULLTABLES
+    // =====================================================
     const [tables] = await promiseDb.query("SHOW TABLES");
 
     const fullTables = tables
       .map(t => Object.values(t)[0])
-      .filter(name => name.endsWith("_fulltable"));
+      .filter(name => {
+        if (!name.endsWith("_fulltable")) return false;
+        const base = name.replace(/_fulltable$/, "").toLowerCase();
+        return allowedBaseNames.has(base);
+      });
 
-    // =============================
-    // 2️⃣ MAP LOGICAL DATASETS
-    // =============================
+    if (fullTables.length === 0) {
+      return res.json({
+        success: true,
+        mode: "auto",
+        results: {},
+        message: "No processed tables available"
+      });
+    }
+
+    // =====================================================
+    // 3️⃣ MAP LOGICAL DATASETS
+    // =====================================================
     const datasetMap = {};
-    // sales_data_2024 -> sales_data_2024_fulltable
-
     for (const table of fullTables) {
       const base = table.replace(/_fulltable$/, "");
       datasetMap[base] = table;
@@ -2415,9 +2650,9 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
 
     const logicalDatasets = Object.keys(datasetMap);
 
-    // =============================
-    // 3️⃣ FILTER DATASETS BY QUESTION
-    // =============================
+    // =====================================================
+    // 4️⃣ FILTER DATASETS BY QUESTION
+    // =====================================================
     const qLower = question.toLowerCase();
 
     const matchedDatasets = logicalDatasets.filter(ds => {
@@ -2433,16 +2668,18 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
     console.log("🧭 MODE:", mode);
     console.log("📦 DATASETS USED:", datasetsUsed);
 
+    // =====================================================
+    // 5️⃣ LOAD SCHEMA (SAFE)
+    // =====================================================
     const schemaInfo = {};
-
     for (const ds of datasetsUsed) {
       const tableName = datasetMap[ds];
       schemaInfo[tableName] = await getTableColumns(tableName);
     }
 
-    // =============================
-    // 4️⃣ BUILD AI PROMPT
-    // =============================
+    // =====================================================
+    // 6️⃣ BUILD AI PROMPT
+    // =====================================================
     const prompt = `
 You are a senior MySQL data analyst.
 
@@ -2451,8 +2688,6 @@ STRICT RULES:
 - Tables are FULLTABLES (raw data)
 - NEVER invent table names or column names
 - Choose the MOST RELEVANT column based on the question meaning
-- If an exact column does not exist, infer using the closest matching column
-- If a "name" column does not exist, use an ID or descriptive column instead
 - Return ONLY valid JSON (no explanation)
 
 SCHEMA:
@@ -2484,29 +2719,56 @@ User Question:
 "${question}"
 `;
 
-
-    // =============================
-    // 5️⃣ OPENAI CALL
-    // =============================
-    const aiRes = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0,
-      response_format: { type: "json_object" }
-    });
-
-    const aiJson = safeParseJSON(aiRes.choices[0].message.content);
+    // =====================================================
+    // 7️⃣ OPENAI CALL
+    // =====================================================
+    const aiRes = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model: "llama-3.3-70b-versatile", // choose your Groq model
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0,
+        max_tokens: 2048
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${GROQ_KEY}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    const text = aiRes.data.choices[0].message.content;
+    const aiJson = safeParseJSON(text);
 
     if (!aiJson || !Array.isArray(aiJson.queries)) {
       return res.status(400).json({
         error: "Invalid AI response",
-        raw: aiRes.choices[0].message.content
+        raw: text
       });
     }
+    // =====================================================
+    // 🔒 8️⃣ FINAL SQL SAFETY CHECK
+    // =====================================================
+    const allowedTableSet = new Set(fullTables.map(t => t.toLowerCase()));
 
-    // =============================
-    // 6️⃣ EXECUTE SQL (ALWAYS PER TABLE FIRST)
-    // =============================
+    for (const q of aiJson.queries) {
+      const sql = q.sql.toLowerCase();
+
+      const hasAccess = [...allowedTableSet].some(t =>
+        sql.includes(` ${t} `) || sql.includes(`\`${t}\``)
+      );
+
+      if (!hasAccess) {
+        return res.status(403).json({
+          error: "Unauthorized dataset access",
+          sql
+        });
+      }
+    }
+
+    // =====================================================
+    // 9️⃣ EXECUTE SQL
+    // =====================================================
     const perTableResults = {};
 
     for (const q of aiJson.queries) {
@@ -2517,17 +2779,33 @@ User Question:
       }
 
       console.log("🧠 EXECUTING:", sql);
-
       const [rows] = await promiseDb.query(sql);
       perTableResults[q.dataset] = rows;
     }
 
-    // =============================
-    // 7️⃣ POPUP DECISION (CLEAN NAMES ONLY)
-    // =============================
+    // =====================================================
+    // 🚫 NO DATA FOUND CHECK
+    // =====================================================
+    const hasAnyData = Object.values(perTableResults).some(
+      rows => Array.isArray(rows) && rows.length > 0
+    );
+
+    if (!hasAnyData) {
+      return res.json({
+        success: true,
+        mode: forceMode || aiJson.mode || "auto",
+        results: {},
+        message: "No data found for your question"
+      });
+    }
+
+
+    // =====================================================
+    // 🔔 POPUP DECISION (AUTHORIZED & SAFE)
+    // =====================================================
     const tablesWithData = Object.entries(perTableResults)
       .filter(([_, rows]) => Array.isArray(rows) && rows.length > 0)
-      .map(([dataset]) => dataset.replace(/_fulltable$/, "")); // 🔥 ONLY CHANGE
+      .map(([dataset]) => dataset.replace(/_fulltable$/, ""));
 
     if (tablesWithData.length > 1 && !forceMode) {
       return res.json({
@@ -2536,21 +2814,15 @@ User Question:
       });
     }
 
-    // =============================
-    // 8️⃣ FINAL RESULT (USER WINS)
-    // =============================
-    const finalMode = forceMode || aiJson.mode;
 
+    // =====================================================
+    // 🔟 FINAL RESPONSE
+    // =====================================================
+    const finalMode = forceMode || aiJson.mode;
     let results = {};
 
     if (finalMode === "combined") {
-      let combinedRows = [];
-
-      for (const rows of Object.values(perTableResults)) {
-        combinedRows = combinedRows.concat(rows);
-      }
-
-      results["combined_result"] = combinedRows;
+      results.combined_result = Object.values(perTableResults).flat();
     } else {
       results = perTableResults;
     }
@@ -2566,6 +2838,288 @@ User Question:
     res.status(500).json({ error: "NLP query failed" });
   }
 });
+
+app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
+  try {
+    const { question, tables } = req.body;
+    const userEmail = req.user.email;
+ 
+    if (!question || !tables || !Array.isArray(tables)) {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+ 
+    const filePath = path.join(
+      __dirname,
+      "uploads",
+      `NLP_Report_${Date.now()}.pdf`
+    );
+ 
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const stream = fs.createWriteStream(filePath);
+    doc.pipe(stream);
+ 
+    // =============================
+    // HEADER
+    // =============================
+    doc.fontSize(18).text("NLP Analysis Report", { align: "center" });
+    doc.moveDown();
+    doc.fontSize(12).text(`Question: ${question}`);
+    doc.text(`Generated for: ${userEmail}`);
+    doc.moveDown(2);
+ 
+    // =============================
+    // LOOP EACH DATASET
+    // =============================
+    for (const block of tables) {
+      const { table, insights, rows, chartImage } = block;
+ 
+      // ---------- DATASET TITLE ----------
+      doc.fontSize(14).text(table.toUpperCase(), { underline: true });
+      doc.moveDown();
+ 
+      // ---------- INSIGHTS ----------
+      // =============================
+      // 🧠 INSIGHTS BOX (DESIGNED)
+      // =============================
+      doc.fontSize(13).fillColor("#000").text("Insights");
+      doc.moveDown(0.5);
+ 
+      // Box dimensions
+      const boxX = doc.x;
+      const boxY = doc.y;
+      const boxWidth = doc.page.width - 80;
+      const boxPadding = 10;
+ 
+      // Calculate box height dynamically
+      const boxHeight = insights.length * 16 + boxPadding * 2;
+ 
+      // Draw background box
+      doc
+        .rect(boxX, boxY, boxWidth, boxHeight)
+        .fill("#f3f4f6");
+ 
+      // Write insights text
+      doc.fillColor("#000").fontSize(10);
+ 
+      let textY = boxY + boxPadding;
+      insights.forEach((i, idx) => {
+        doc.text(`${idx + 1}. ${i}`, boxX + boxPadding, textY, {
+          width: boxWidth - boxPadding * 2
+        });
+        textY += 16;
+      });
+ 
+      // Move cursor below box
+      doc.y = boxY + boxHeight + 15;
+ 
+ 
+      // ---------- CHART ----------
+      // Move cursor below insights box
+      doc.y = boxY + boxHeight + 20;
+ 
+      // =============================
+      // 📊 CHART (SAME PAGE, BELOW INSIGHTS)
+      // =============================
+      if (chartImage) {
+        const base64 = chartImage.replace(/^data:image\/png;base64,/, "");
+        const imgBuffer = Buffer.from(base64, "base64");
+ 
+        const chartWidth = doc.page.width - 80;
+        const chartHeight = 260;
+ 
+        // Auto page break safety
+        if (doc.y + chartHeight > doc.page.height - 40) {
+          doc.addPage();
+        }
+ 
+        doc.fontSize(12).fillColor("#000").text("Chart Analysis");
+        doc.moveDown(0.5);
+ 
+        doc.image(imgBuffer, {
+          fit: [chartWidth, chartHeight],
+          align: "center"
+        });
+ 
+        doc.moveDown(1.5);
+      }
+ 
+      // =============================
+      // 📋 TABLE DESIGN (LIKE UI)
+      // =============================
+      doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
+ 
+      const columns = Object.keys(rows[0]);
+ 
+      const tableX = 40;
+      let tableY = doc.y;
+      const rowHeight = 22;
+      const pageBottom = doc.page.height - 50;
+ 
+      // -------------------------------------------------
+      // 🔹 AUTO COLUMN WIDTH CALCULATION
+      // -------------------------------------------------
+      const minColWidth = 60;
+      const maxColWidth = 160;
+ 
+      // Estimate width based on header + first 10 rows
+      const colWidths = columns.map(col => {
+        let maxLen = col.length;
+ 
+        rows.slice(0, 10).forEach(r => {
+          const val = String(r[col] ?? "");
+          if (val.length > maxLen) maxLen = val.length;
+        });
+ 
+        // Approx width per character
+        const estimated = maxLen * 6.5;
+ 
+        return Math.max(minColWidth, Math.min(maxColWidth, estimated));
+      });
+ 
+      // Scale down if exceeds page width
+      const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+      const availableWidth = doc.page.width - 80;
+ 
+      if (totalWidth > availableWidth) {
+        const scale = availableWidth / totalWidth;
+        for (let i = 0; i < colWidths.length; i++) {
+          colWidths[i] *= scale;
+        }
+      }
+ 
+      // -------------------------------------------------
+      // 🔹 HEADER DRAW FUNCTION
+      // -------------------------------------------------
+      // ---------- HEADER DRAW FUNCTION (FIXED) ----------
+      const headerHeight = 28;
+ 
+      const drawHeader = () => {
+        let x = tableX;
+ 
+        columns.forEach((col, i) => {
+          // 🔵 Header background (ONLY this row)
+          doc
+            .rect(x, tableY, colWidths[i], headerHeight)
+            .fill("#007bff");
+ 
+          // 🔲 Header border (same table style)
+          doc
+            .rect(x, tableY, colWidths[i], headerHeight)
+            .stroke();
+ 
+          // Header text
+          doc
+            .fillColor("#ffffff")
+            .font("Helvetica-Bold")
+            .fontSize(9)
+            .text(
+              col.replace(/_/g, " "),
+              x + 6,
+              tableY + 8,
+              {
+                width: colWidths[i] - 12,
+                align: "center",
+                lineBreak: true,
+                wordBreak: false
+              }
+            );
+ 
+          x += colWidths[i];
+        });
+ 
+        doc.font("Helvetica").fillColor("#000");
+        tableY += headerHeight;
+      };
+ 
+ 
+      // -------------------------------------------------
+      // 🔹 DRAW HEADER
+      // -------------------------------------------------
+      drawHeader();
+ 
+      // -------------------------------------------------
+      // 🔹 DRAW ROWS
+      // -------------------------------------------------
+      rows.forEach((row, rowIndex) => {
+        if (tableY > pageBottom) {
+          doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
+          tableY = 40;
+          drawHeader();
+        }
+ 
+        let x = tableX;
+ 
+        columns.forEach((col, i) => {
+ 
+          // Zebra background
+          if (rowIndex % 2 === 0) {
+            doc
+              .rect(x, tableY, colWidths[i], rowHeight)
+              .fill("#f9fafb");
+          }
+ 
+          // Border
+          doc
+            .rect(x, tableY, colWidths[i], rowHeight)
+            .stroke();
+ 
+          // ✅ FIXED
+          const value = row[col];
+          const isNumber = typeof value === "number";
+ 
+          doc
+            .fillColor("#000")
+            .fontSize(9)
+            .text(
+              value != null ? String(value) : "",
+              x + 6,
+              tableY + 7,
+              {
+                width: colWidths[i] - 12,
+                ellipsis: true,
+                align: isNumber ? "right" : "left"
+              }
+            );
+ 
+          x += colWidths[i];
+        });
+ 
+        tableY += rowHeight;
+      });
+ 
+      doc.addPage();
+    }
+ 
+    doc.end();
+ 
+    // =============================
+    // EMAIL PDF
+    // =============================
+    stream.on("finish", async () => {
+      await transporter.sendMail({
+        to: userEmail,
+        subject: "📄 NLP Report (Insights + Chart + Table)",
+        text: "Your NLP analysis report is attached.",
+        attachments: [
+          {
+            filename: "NLP_Report.pdf",
+            path: filePath
+          }
+        ]
+      });
+ 
+      // cleanup
+      setTimeout(() => fs.unlinkSync(filePath), 30000);
+ 
+      res.json({ success: true });
+    });
+ 
+  } catch (err) {
+    console.error("❌ PDF ERROR:", err);
+    res.status(500).json({ error: "PDF generation failed" });
+  }
+});
+ 
 
 
 // =============================
