@@ -69,7 +69,11 @@ async function insertFileRunStat({
   ]);
 }
 
-
+// chat bot  Groq ai
+const Groq = require("groq-sdk");
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
 // CommonJS require
 // const client = new OpenAI({
@@ -1255,7 +1259,7 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
 // =======================================================
 // ⏰ API CRON – FINAL & CORRECT
 // =======================================================
-cron.schedule("0 * * * *", async () => {
+cron.schedule("*/5 * * * *", async () => {
   console.log("⏰ API cron started (every 2 minutes)");
 
   try {
@@ -1378,14 +1382,14 @@ cron.schedule("0 * * * *", async () => {
 // =======================================================
 // 📧 DAILY SUMMARY MAIL CRON (FILES + API TABLE + API UPDATES)
 // =======================================================
-cron.schedule("30 0 * * *", async () => {
+cron.schedule("*/5 * * * *", async () => {
   console.log("📧 Daily Summary Mail Cron Started");
 
   const [users] = await db.promise().query(`
     SELECT id, email, role, company_name
     FROM users
     WHERE status = 'ACTIVE'
-  `);
+  `);                               
 
   for (const user of users) {
 
@@ -2316,27 +2320,36 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   try {
     const { question } = req.body;
-
+ 
     if (!question) {
       return res.status(400).json({
         success: false,
         error: "Question is required",
       });
     }
-
-    const response = await client.chat.completions.create({
-      model: "gpt-4o-mini",
+    ////chat gpt
+    // const response = await client.chat.completions.create({
+    //   model: "gpt-4o-mini",
+    //   messages: [
+    //     { role: "system", content: "You are a helpful assistant." },
+    //     { role: "user", content: question },
+    //   ],
+    // });
+ 
+    //groq ai
+    const response = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant", // 🔥 super fast
       messages: [
         { role: "system", content: "You are a helpful assistant." },
         { role: "user", content: question },
       ],
     });
-
+ 
     res.json({
       success: true,
       answer: response.choices[0].message.content,
     });
-
+ 
   } catch (error) {
     console.error("❌ OpenAI Error:", error.message);
     res.status(500).json({
@@ -2345,6 +2358,7 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 });
+ 
 
 
 // =============================
