@@ -398,8 +398,8 @@ app.post('/register', async (req, res) => {
 
     await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         firstName,
         lastName,
@@ -408,7 +408,10 @@ app.post('/register', async (req, res) => {
         hashedPassword,
         company_name,
         role,
-        status
+        status,
+        9, // report_hour
+        0, // report_minute
+        'Asia/Kolkata' // default timezone
       ]
     );
 
@@ -463,8 +466,8 @@ app.post('/company-register', async (req, res) => {
     // 💾 INSERT USER
     await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         firstName,
         lastName,
@@ -473,7 +476,10 @@ app.post('/company-register', async (req, res) => {
         hashedPassword,
         company_name,
         role,
-        status
+        status,
+        9, // report_hour
+        0, // report_minute
+        'Asia/Kolkata' // default timezone
       ]
     );
 
@@ -964,7 +970,10 @@ app.get('/user/:email', async (req, res) => {
         mobile, 
         role,
         company_name AS company_name,
-        last_login AS lastLogin
+        last_login AS lastLogin,
+        report_hour,
+        report_minute,
+        timezone
       FROM users 
       WHERE email = ?`,
       [email]
@@ -1259,6 +1268,7 @@ app.post("/save-api-data", authenticateToken, async (req, res) => {
 // =======================================================
 // ⏰ API CRON – FINAL & CORRECT
 // =======================================================
+
 cron.schedule("*/5 * * * *", async () => {
   console.log("⏰ API cron started (every 2 minutes)");
 
@@ -1379,26 +1389,133 @@ cron.schedule("*/5 * * * *", async () => {
     console.error("❌ Cron fatal error:", err.message);
   }
 });
+
 // =======================================================
-// 📧 DAILY SUMMARY MAIL CRON (FILES + API TABLE + API UPDATES)
+// 📊 UPDATE DAILY REPORT TIME
 // =======================================================
-cron.schedule("*/5 * * * *", async () => {
-  console.log("📧 Daily Summary Mail Cron Started");
+app.post("/api/report-time", async (req, res) => {
+  const { email, hour, minute, timezone } = req.body;
 
-  const [users] = await db.promise().query(`
-    SELECT id, email, role, company_name
-    FROM users
-    WHERE status = 'ACTIVE'
-  `);                               
+  try {
+    const [result] = await db.promise().query(
+      `
+      UPDATE users
+      SET report_hour = ?, report_minute = ?, timezone = ?, last_report_sent = NULL
+      WHERE email = ?
+      `,
+      [hour, minute, timezone || 'Asia/Kolkata', email]
+    );
 
-  for (const user of users) {
+    if (result.affectedRows > 0) {
+      res.json({ success: true });
+    } else {
+      res.json({ success: false });
+    }
 
-    // ===================================================
-    // 📁 FILE SUMMARY (TODAY)
-    // ===================================================
-    const [files] = await db.promise().query(`
-      SELECT
-        file_name,
+  } catch (err) {
+    console.error("Report time update error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// =======================================================
+// 📊 GET DAILY REPORT TIME
+// =======================================================
+app.get("/api/report-time/:email", async (req, res) => {
+  const { email } = req.params;
+
+  try {
+    const [rows] = await db.promise().query(
+      `SELECT report_hour, report_minute, timezone FROM users WHERE email = ?`,
+      [email]
+    );
+
+    if (rows.length > 0) {
+      res.json({
+        success: true,
+        hour: rows[0].report_hour,
+        minute: rows[0].report_minute,
+        timezone: rows[0].timezone
+      });
+    } else {
+      res.json({ success: false });
+    }
+  } catch (err) {
+    console.error("Report time fetch error:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+// =======================================================
+// 📧 DAILY SUMMARY MAIL CRON (Dynamic Per User)
+// Runs Every Minute
+// =======================================================
+cron.schedule("* * * * *", async () => {
+  console.log("⏰ Checking Daily Report Schedule...");
+
+  try {
+    const [users] = await db.promise().query(`
+      SELECT id, email, role, company_name,
+             report_hour, report_minute, timezone, last_report_sent
+      FROM users
+      WHERE status = 'ACTIVE'
+    `);
+
+    for (const user of users) {
+      const userTimezone = user.timezone || "Asia/Kolkata";
+      const now = new Date(
+        new Date().toLocaleString("en-US", { timeZone: userTimezone })
+      );
+
+      const currentHour = now.getHours();
+      const currentMinute = now.getMinutes();
+      const todayDate = now.toISOString().split("T")[0];
+
+      // ⛔ Skip if already sent today
+      if (
+        user.last_report_sent &&
+        new Date(user.last_report_sent).toISOString().split("T")[0] === todayDate
+      ) {
+        continue;
+      }
+
+      // ✅ Check time match
+      if (
+        user.report_hour === currentHour &&
+        user.report_minute === currentMinute
+      ) {
+        // 🔒 ATOMIC LOCK: Update first, send only if we claimed the row
+        const [updateResult] = await db.promise().query(
+          `UPDATE users
+           SET last_report_sent = CURDATE()
+           WHERE id = ?
+             AND (last_report_sent IS NULL OR last_report_sent < CURDATE())`,
+          [user.id]
+        );
+
+        if (updateResult.affectedRows > 0) {
+          console.log(`📤 Sending report to ${user.email} (${userTimezone})`);
+          await sendDailyReport(user);
+          console.log(`✅ Report sent: ${user.email}`);
+        }
+      }
+    }
+
+  } catch (err) {
+    console.error("Cron error:", err);
+  }
+});
+// =======================================================
+// 📩 SEND DAILY REPORT FUNCTION
+// =======================================================
+async function sendDailyReport(user) {
+
+  // ===================================================
+  // 📁 FILE SUMMARY (TODAY)
+  // ===================================================
+  const [files] = await db.promise().query(`
+    SELECT
+    	file_name,
         status,
         rows_count,
         processed_at
@@ -1409,60 +1526,64 @@ cron.schedule("*/5 * * * *", async () => {
       ORDER BY processed_at DESC
     `, [user.company_name || user.id]);
 
-    // ===================================================
-    // 🌐 API SUMMARY (AGGREGATED – TODAY)
-    // ===================================================
-    const [apis] = await db.promise().query(`
-      SELECT
-        api_name,
-        COUNT(*) AS total_runs,
-        SUM(new_rows) AS total_new_rows,
-        MAX(run_time) AS last_run,
-        CASE
-          WHEN SUM(new_rows) > 0 THEN 'UPDATED'
-          ELSE 'NO_CHANGE'
-        END AS status
-      FROM api_run_stats
-      WHERE
-        (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
-        AND DATE(run_time) = CURDATE()
-      GROUP BY api_name
-      ORDER BY api_name
-    `, [user.company_name || user.id]);
+  // ===================================================
+  // 🌐 API SUMMARY (AGGREGATED – TODAY)
+  // ===================================================
+  const [apis] = await db.promise().query(`
+    SELECT
+      api_name,
+      COUNT(*) AS total_runs,
+      SUM(new_rows) AS total_new_rows,
+      MAX(run_time) AS last_run,
+      CASE
+        WHEN SUM(new_rows) > 0 THEN 'UPDATED'
+        ELSE 'NO_CHANGE'
+      END AS status
+    FROM api_run_stats
+    WHERE
+      (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
+      AND DATE(run_time) = CURDATE()
+    GROUP BY api_name
+    ORDER BY api_name
+  `, [user.company_name || user.id]);
 
-    // ===================================================
-    // 🌐 API UPDATE DETAILS (ONLY WHEN DATA CHANGED)
-    // ===================================================
-    const [apiChanges] = await db.promise().query(`
-      SELECT
-        api_name,
-        run_time,
-        new_rows
-      FROM api_run_stats
-      WHERE
-        (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
-        AND DATE(run_time) = CURDATE()
-        AND new_rows > 0
-      ORDER BY api_name, run_time
-    `, [user.company_name || user.id]);
+  // ===================================================
+  // 🌐 API UPDATE DETAILS (ONLY WHEN DATA CHANGED)
+  // ===================================================
+  const [apiChanges] = await db.promise().query(`
+    SELECT
+      api_name,
+      run_time,
+      new_rows,
+      status
+    FROM api_run_stats
+    WHERE
+      (${user.company_name ? "company_name = ?" : "uploaded_by = ?"})
+      AND DATE(run_time) = CURDATE()
+      AND new_rows > 0
+    ORDER BY api_name, run_time
+  `, [user.company_name || user.id]);
 
-    if (!files.length && !apis.length && !apiChanges.length) continue;
-
-    const html = buildDailySummaryEmail(
-      user,
-      files,
-      apis,
-      apiChanges
-    );
-
-    await transporter.sendMail({
-      to: user.email,
-      subject: "📊 Cloud360 Daily Data Summary",
-      html
-    });
+  if (!files.length && !apis.length && !apiChanges.length) {
+    console.log("No activity today for:", user.email);
+    return;
   }
-});
 
+  const html = buildDailySummaryEmail(
+    user,
+    files,
+    apis,
+    apiChanges
+  );
+
+  await transporter.sendMail({
+    to: user.email,
+    subject: "📊 Cloud360 Daily Data Summary",
+    html
+  });
+
+  console.log("✅ Report sent:", user.email);
+}
 
 // =======================================================
 // ✉️ EMAIL TEMPLATE
@@ -1508,7 +1629,7 @@ function buildDailySummaryEmail(user, files, apis, apiChanges) {
   ">
   <thead>
     <tr style="background:#f4f6f8;">
-      <th style="width:40%;border:1px solid #ddd;padding:6px;text-align:center;">File</th>
+      <th style="width:40%;border:1px solid #ddd;padding:6px;text-align:center;">File Name</th>
       <th style="width:15%;border:1px solid #ddd;padding:6px;text-align:center;">Status</th>
       <th style="width:15%;border:1px solid #ddd;padding:6px;text-align:center;">Rows</th>
       <th style="width:30%;border:1px solid #ddd;padding:6px;text-align:center;">Processed At</th>
@@ -1641,7 +1762,6 @@ function buildDailySummaryEmail(user, files, apis, apiChanges) {
   `;
 }
 
-
 // --------------------------------------------------------
 // 💾 Utility: Flatten nested objects for CSV
 // --------------------------------------------------------
@@ -1657,6 +1777,7 @@ const flattenObject = (obj, prefix = '') =>
     }
     return acc;
   }, {});
+
 
 
 // ======================
@@ -1766,6 +1887,20 @@ app.post("/upload", authenticateToken, (req, res, next) => {
           status
         ]
       );
+
+      // 📊 LOG ACTIVITY FOR DAILY REPORT
+      try {
+        const { data } = await readCSV(finalPath);
+        await insertFileRunStat({
+          file_name: baseFileName,
+          company_name: companyName,
+          uploaded_by: req.user.id,
+          rows_count: data.length,
+          status: "DONE"
+        });
+      } catch (err) {
+        console.error("❌ Error logging file stat:", err);
+      }
 
 
       return res.json({
@@ -1877,6 +2012,20 @@ app.post("/upload", authenticateToken, (req, res, next) => {
           req.user.id
         ]
       );
+
+      // 📊 LOG ACTIVITY FOR DAILY REPORT
+      try {
+        const { data } = await readCSV(finalPath);
+        await insertFileRunStat({
+          file_name: baseFileName,
+          company_name: companyName,
+          uploaded_by: req.user.id,
+          rows_count: data.length,
+          status: "DONE"
+        });
+      } catch (err) {
+        console.error("❌ Error logging merged file stat:", err);
+      }
 
 
       return res.json({
@@ -2315,50 +2464,109 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
 
 
 // =============================
-// ✅ OPENAI CHAT API
+// ✅ GROQ CHAT API (DATA AWARE)
 // =============================
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", authenticateToken, async (req, res) => {
   try {
     const { question } = req.body;
- 
+    const { id: userId, company_name } = req.user;
+
     if (!question) {
       return res.status(400).json({
         success: false,
         error: "Question is required",
       });
     }
-    ////chat gpt
-    // const response = await client.chat.completions.create({
-    //   model: "gpt-4o-mini",
-    //   messages: [
-    //     { role: "system", content: "You are a helpful assistant." },
-    //     { role: "user", content: question },
-    //   ],
-    // });
- 
-    //groq ai
+
+    // 1️⃣ FETCH USER DATA CONTEXT
+    let metadata = {
+      files: [],
+      apis: [],
+      processedTables: []
+    };
+
+    try {
+      // Fetch Uploaded Files
+      const [files] = await promiseDb.query(
+        `SELECT file_name FROM files WHERE ${company_name ? "company_name = ?" : "uploaded_by = ?"}`,
+        [company_name || userId]
+      );
+      metadata.files = files.map(f => f.file_name);
+
+      // Fetch API Data
+      const [apis] = await promiseDb.query(
+        `SELECT file_name FROM api_data WHERE ${company_name ? "company_name = ?" : "uploaded_by = ?"}`,
+        [company_name || userId]
+      );
+      metadata.apis = apis.map(a => a.file_name);
+
+      // Fetch Processed Tables (Authorized)
+      const [tables] = await promiseDb.query("SHOW TABLES");
+      const allowedBaseNames = new Set([...metadata.files, ...metadata.apis].map(name => name.toLowerCase().replace(/\.[^/.]+$/, "")));
+
+      metadata.processedTables = tables
+        .map(t => Object.values(t)[0])
+        .filter(name => {
+          const match = name.match(/(.+)_(fulltable|entity|metrics|dimension)$/i);
+          if (!match) return false;
+          return allowedBaseNames.has(match[1].toLowerCase());
+        });
+
+    } catch (dbErr) {
+      console.error("❌ Database metadata fetch error:", dbErr);
+    }
+
+    // 2️⃣ CONSTRUCT SYSTEM PROMPT
+    const systemPrompt = `
+You are "Cloud360 - AI Assistant", a professional and helpful guide for the Cloud360 data platform.
+
+**Product Knowledge:**
+Cloud360 is an advanced data engineering platform that allows users to:
+1. **Upload Files**: Upload CSV/Excel files for processing.
+2. **API Integration**: Fetch data from external APIs and schedule periodic updates.
+3. **Spark Processing**: Transform raw data into structured tables (Full-table, Entities, Metrics, Dimensions) using Spark.
+4. **Natural Language Queries (NLP)**: Query data using plain English (handled by the NLP Results section).
+5. **Daily Reports**: Receive automated email summaries of data activities.
+6. **Dashboard**: Visualize data stats and processed results.
+
+**User Data Context:**
+The user currently logged in has access to the following:
+- Uploaded Files: ${metadata.files.join(", ") || "None"}
+- Configured APIs: ${metadata.apis.join(", ") || "None"}
+- Processed Data Tables: ${metadata.processedTables.join(", ") || "None"}
+
+**Instructions:**
+- Answer questions about the user's files, APIs, and processed tables accurately using the context provided.
+- Explain Cloud360 features helpfully if asked.
+- If a user asks a question about specific data that requires complex analysis (e.g., "Show me the total sales"), suggest they use the "NLP Results" or "Dashboard" section for precise SQL-based insights.
+- Be concise, professional, and friendly.
+- If you don't know the answer or the data is not in the context, say so politely.
+`;
+
+    // 3️⃣ CALL GROQ AI
     const response = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant", // 🔥 super fast
+      model: "llama-3.1-8b-instant",
       messages: [
-        { role: "system", content: "You are a helpful assistant." },
+        { role: "system", content: systemPrompt },
         { role: "user", content: question },
       ],
     });
- 
+
     res.json({
       success: true,
       answer: response.choices[0].message.content,
     });
- 
+
   } catch (error) {
-    console.error("❌ OpenAI Error:", error.message);
+    console.error("❌ Groq/Chat Error:", error.message);
     res.status(500).json({
       success: false,
-      error: "AI Server Error ❌",
+      error: "AI Assistant is currently unavailable ❌",
     });
   }
 });
- 
+
+
 
 
 // =============================
@@ -2517,6 +2725,7 @@ app.put('/change-mobile', async (req, res) => {
     res.status(500).json({ success: false, error: 'Server error' });
   }
 });
+
 // =============================
 // 🧠 NLP HELPER FUNCTIONS
 // =============================
@@ -2589,7 +2798,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
     // =====================================================
     let allowedQuery = "";
     let params = [];
-
     // PERSONAL USER
     if (!company_name) {
       allowedQuery = `
@@ -2621,7 +2829,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
             .replace(/\s+/g, "_")
         )
     );
-
     if (allowedBaseNames.size === 0) {
       return res.json({
         success: true,
@@ -2630,7 +2837,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
         message: "No data available for NLP query"
       });
     }
-
     // =====================================================
     // 🔐 2️⃣ LOAD ONLY AUTHORIZED FULLTABLES
     // =====================================================
@@ -2643,7 +2849,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
         const base = name.replace(/_fulltable$/, "").toLowerCase();
         return allowedBaseNames.has(base);
       });
-
     if (fullTables.length === 0) {
       return res.json({
         success: true,
@@ -2652,7 +2857,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
         message: "No processed tables available"
       });
     }
-
     // =====================================================
     // 3️⃣ MAP LOGICAL DATASETS
     // =====================================================
@@ -2663,7 +2867,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
     }
 
     const logicalDatasets = Object.keys(datasetMap);
-
     // =====================================================
     // 4️⃣ FILTER DATASETS BY QUESTION
     // =====================================================
@@ -2681,7 +2884,6 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
 
     console.log("🧭 MODE:", mode);
     console.log("📦 DATASETS USED:", datasetsUsed);
-
     // =====================================================
     // 5️⃣ LOAD SCHEMA (SAFE)
     // =====================================================
@@ -2690,20 +2892,19 @@ app.post("/nlp/query", authenticateToken, async (req, res) => {
       const tableName = datasetMap[ds];
       schemaInfo[tableName] = await getTableColumns(tableName);
     }
-
     // =====================================================
     // 6️⃣ BUILD AI PROMPT
     // =====================================================
     const prompt = `
 You are a senior MySQL data analyst.
-
+ 
 STRICT RULES:
 - Use ONLY the tables AND columns listed below
 - Tables are FULLTABLES (raw data)
 - NEVER invent table names or column names
 - Choose the MOST RELEVANT column based on the question meaning
 - Return ONLY valid JSON (no explanation)
-
+ 
 SCHEMA:
 ${datasetsUsed
         .map(ds => {
@@ -2712,12 +2913,12 @@ ${datasetsUsed
           return `Table: ${table}\nColumns: ${cols}`;
         })
         .join("\n\n")}
-
+ 
 MODE RULES:
 - combined → aggregate across all tables
 - separate → one query per table
 - auto → choose best mode based on the question
-
+ 
 RETURN FORMAT:
 {
   "mode": "combined | separate | auto",
@@ -2728,11 +2929,10 @@ RETURN FORMAT:
     }
   ]
 }
-
+ 
 User Question:
 "${question}"
 `;
-
     // =====================================================
     // 7️⃣ OPENAI CALL
     // =====================================================
@@ -2753,7 +2953,6 @@ User Question:
     );
     const text = aiRes.data.choices[0].message.content;
     const aiJson = safeParseJSON(text);
-
     if (!aiJson || !Array.isArray(aiJson.queries)) {
       return res.status(400).json({
         error: "Invalid AI response",
@@ -2779,7 +2978,6 @@ User Question:
         });
       }
     }
-
     // =====================================================
     // 9️⃣ EXECUTE SQL
     // =====================================================
@@ -2796,14 +2994,12 @@ User Question:
       const [rows] = await promiseDb.query(sql);
       perTableResults[q.dataset] = rows;
     }
-
     // =====================================================
     // 🚫 NO DATA FOUND CHECK
     // =====================================================
     const hasAnyData = Object.values(perTableResults).some(
       rows => Array.isArray(rows) && rows.length > 0
     );
-
     if (!hasAnyData) {
       return res.json({
         success: true,
@@ -2820,7 +3016,6 @@ User Question:
     const tablesWithData = Object.entries(perTableResults)
       .filter(([_, rows]) => Array.isArray(rows) && rows.length > 0)
       .map(([dataset]) => dataset.replace(/_fulltable$/, ""));
-
     if (tablesWithData.length > 1 && !forceMode) {
       return res.json({
         needsUserChoice: true,
@@ -2857,21 +3052,21 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
   try {
     const { question, tables } = req.body;
     const userEmail = req.user.email;
- 
+
     if (!question || !tables || !Array.isArray(tables)) {
       return res.status(400).json({ error: "Invalid payload" });
     }
- 
+
     const filePath = path.join(
       __dirname,
       "uploads",
       `NLP_Report_${Date.now()}.pdf`
     );
- 
+
     const doc = new PDFDocument({ size: "A4", margin: 40 });
     const stream = fs.createWriteStream(filePath);
     doc.pipe(stream);
- 
+
     // =============================
     // HEADER
     // =============================
@@ -2880,41 +3075,41 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
     doc.fontSize(12).text(`Question: ${question}`);
     doc.text(`Generated for: ${userEmail}`);
     doc.moveDown(2);
- 
+
     // =============================
     // LOOP EACH DATASET
     // =============================
     for (const block of tables) {
       const { table, insights, rows, chartImage } = block;
- 
+
       // ---------- DATASET TITLE ----------
       doc.fontSize(14).text(table.toUpperCase(), { underline: true });
       doc.moveDown();
- 
+
       // ---------- INSIGHTS ----------
       // =============================
       // 🧠 INSIGHTS BOX (DESIGNED)
       // =============================
       doc.fontSize(13).fillColor("#000").text("Insights");
       doc.moveDown(0.5);
- 
+
       // Box dimensions
       const boxX = doc.x;
       const boxY = doc.y;
       const boxWidth = doc.page.width - 80;
       const boxPadding = 10;
- 
+
       // Calculate box height dynamically
       const boxHeight = insights.length * 16 + boxPadding * 2;
- 
+
       // Draw background box
       doc
         .rect(boxX, boxY, boxWidth, boxHeight)
         .fill("#f3f4f6");
- 
+
       // Write insights text
       doc.fillColor("#000").fontSize(10);
- 
+
       let textY = boxY + boxPadding;
       insights.forEach((i, idx) => {
         doc.text(`${idx + 1}. ${i}`, boxX + boxPadding, textY, {
@@ -2922,105 +3117,105 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
         });
         textY += 16;
       });
- 
+
       // Move cursor below box
       doc.y = boxY + boxHeight + 15;
- 
- 
+
+
       // ---------- CHART ----------
       // Move cursor below insights box
       doc.y = boxY + boxHeight + 20;
- 
+
       // =============================
       // 📊 CHART (SAME PAGE, BELOW INSIGHTS)
       // =============================
       if (chartImage) {
         const base64 = chartImage.replace(/^data:image\/png;base64,/, "");
         const imgBuffer = Buffer.from(base64, "base64");
- 
+
         const chartWidth = doc.page.width - 80;
         const chartHeight = 260;
- 
+
         // Auto page break safety
         if (doc.y + chartHeight > doc.page.height - 40) {
           doc.addPage();
         }
- 
+
         doc.fontSize(12).fillColor("#000").text("Chart Analysis");
         doc.moveDown(0.5);
- 
+
         doc.image(imgBuffer, {
           fit: [chartWidth, chartHeight],
           align: "center"
         });
- 
+
         doc.moveDown(1.5);
       }
- 
+
       // =============================
       // 📋 TABLE DESIGN (LIKE UI)
       // =============================
       doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
- 
+
       const columns = Object.keys(rows[0]);
- 
+
       const tableX = 40;
       let tableY = doc.y;
       const rowHeight = 22;
       const pageBottom = doc.page.height - 50;
- 
+
       // -------------------------------------------------
       // 🔹 AUTO COLUMN WIDTH CALCULATION
       // -------------------------------------------------
       const minColWidth = 60;
       const maxColWidth = 160;
- 
+
       // Estimate width based on header + first 10 rows
       const colWidths = columns.map(col => {
         let maxLen = col.length;
- 
+
         rows.slice(0, 10).forEach(r => {
           const val = String(r[col] ?? "");
           if (val.length > maxLen) maxLen = val.length;
         });
- 
+
         // Approx width per character
         const estimated = maxLen * 6.5;
- 
+
         return Math.max(minColWidth, Math.min(maxColWidth, estimated));
       });
- 
+
       // Scale down if exceeds page width
       const totalWidth = colWidths.reduce((a, b) => a + b, 0);
       const availableWidth = doc.page.width - 80;
- 
+
       if (totalWidth > availableWidth) {
         const scale = availableWidth / totalWidth;
         for (let i = 0; i < colWidths.length; i++) {
           colWidths[i] *= scale;
         }
       }
- 
+
       // -------------------------------------------------
       // 🔹 HEADER DRAW FUNCTION
       // -------------------------------------------------
       // ---------- HEADER DRAW FUNCTION (FIXED) ----------
       const headerHeight = 28;
- 
+
       const drawHeader = () => {
         let x = tableX;
- 
+
         columns.forEach((col, i) => {
           // 🔵 Header background (ONLY this row)
           doc
             .rect(x, tableY, colWidths[i], headerHeight)
             .fill("#007bff");
- 
+
           // 🔲 Header border (same table style)
           doc
             .rect(x, tableY, colWidths[i], headerHeight)
             .stroke();
- 
+
           // Header text
           doc
             .fillColor("#ffffff")
@@ -3037,20 +3232,20 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
                 wordBreak: false
               }
             );
- 
+
           x += colWidths[i];
         });
- 
+
         doc.font("Helvetica").fillColor("#000");
         tableY += headerHeight;
       };
- 
- 
+
+
       // -------------------------------------------------
       // 🔹 DRAW HEADER
       // -------------------------------------------------
       drawHeader();
- 
+
       // -------------------------------------------------
       // 🔹 DRAW ROWS
       // -------------------------------------------------
@@ -3060,27 +3255,27 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
           tableY = 40;
           drawHeader();
         }
- 
+
         let x = tableX;
- 
+
         columns.forEach((col, i) => {
- 
+
           // Zebra background
           if (rowIndex % 2 === 0) {
             doc
               .rect(x, tableY, colWidths[i], rowHeight)
               .fill("#f9fafb");
           }
- 
+
           // Border
           doc
             .rect(x, tableY, colWidths[i], rowHeight)
             .stroke();
- 
+
           // ✅ FIXED
           const value = row[col];
           const isNumber = typeof value === "number";
- 
+
           doc
             .fillColor("#000")
             .fontSize(9)
@@ -3094,18 +3289,18 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
                 align: isNumber ? "right" : "left"
               }
             );
- 
+
           x += colWidths[i];
         });
- 
+
         tableY += rowHeight;
       });
- 
+
       doc.addPage();
     }
- 
+
     doc.end();
- 
+
     // =============================
     // EMAIL PDF
     // =============================
@@ -3121,19 +3316,300 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
           }
         ]
       });
- 
+
       // cleanup
       setTimeout(() => fs.unlinkSync(filePath), 30000);
- 
+
       res.json({ success: true });
     });
- 
+
   } catch (err) {
     console.error("❌ PDF ERROR:", err);
     res.status(500).json({ error: "PDF generation failed" });
   }
 });
- 
+
+app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
+  try {
+    const { question, tables } = req.body;
+    const userEmail = req.user.email;
+
+    if (!question || !tables || !Array.isArray(tables)) {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
+
+    const filePath = path.join(
+      __dirname,
+      "uploads",
+      `NLP_Report_${Date.now()}.pdf`
+    );
+
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const stream = fs.createWriteStream(filePath);
+    doc.pipe(stream);
+
+    // =============================
+    // HEADER
+    // =============================
+    doc.fontSize(18).text("NLP Analysis Report", { align: "center" });
+    doc.moveDown();
+    doc.fontSize(12).text(`Question: ${question}`);
+    doc.text(`Generated for: ${userEmail}`);
+    doc.moveDown(2);
+
+    // =============================
+    // LOOP EACH DATASET
+    // =============================
+    for (const block of tables) {
+      const { table, insights, rows, chartImage } = block;
+
+      // ---------- DATASET TITLE ----------
+      doc.fontSize(14).text(table.toUpperCase(), { underline: true });
+      doc.moveDown();
+
+      // ---------- INSIGHTS ----------
+      // =============================
+      // 🧠 INSIGHTS BOX (DESIGNED)
+      // =============================
+      doc.fontSize(13).fillColor("#000").text("Insights");
+      doc.moveDown(0.5);
+
+      // Box dimensions
+      const boxX = doc.x;
+      const boxY = doc.y;
+      const boxWidth = doc.page.width - 80;
+      const boxPadding = 10;
+
+      // Calculate box height dynamically
+      const boxHeight = insights.length * 16 + boxPadding * 2;
+
+      // Draw background box
+      doc
+        .rect(boxX, boxY, boxWidth, boxHeight)
+        .fill("#f3f4f6");
+
+      // Write insights text
+      doc.fillColor("#000").fontSize(10);
+
+      let textY = boxY + boxPadding;
+      insights.forEach((i, idx) => {
+        doc.text(`${idx + 1}. ${i}`, boxX + boxPadding, textY, {
+          width: boxWidth - boxPadding * 2
+        });
+        textY += 16;
+      });
+
+      // Move cursor below box
+      doc.y = boxY + boxHeight + 15;
+
+
+      // ---------- CHART ----------
+      // Move cursor below insights box
+      doc.y = boxY + boxHeight + 20;
+
+      // =============================
+      // 📊 CHART (SAME PAGE, BELOW INSIGHTS)
+      // =============================
+      if (chartImage) {
+        const base64 = chartImage.replace(/^data:image\/png;base64,/, "");
+        const imgBuffer = Buffer.from(base64, "base64");
+
+        const chartWidth = doc.page.width - 80;
+        const chartHeight = 260;
+
+        // Auto page break safety
+        if (doc.y + chartHeight > doc.page.height - 40) {
+          doc.addPage();
+        }
+
+        doc.fontSize(12).fillColor("#000").text("Chart Analysis");
+        doc.moveDown(0.5);
+
+        doc.image(imgBuffer, {
+          fit: [chartWidth, chartHeight],
+          align: "center"
+        });
+
+        doc.moveDown(1.5);
+      }
+
+      // =============================
+      // 📋 TABLE DESIGN (LIKE UI)
+      // =============================
+      doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
+
+      const columns = Object.keys(rows[0]);
+
+      const tableX = 40;
+      let tableY = doc.y;
+      const rowHeight = 22;
+      const pageBottom = doc.page.height - 50;
+
+      // -------------------------------------------------
+      // 🔹 AUTO COLUMN WIDTH CALCULATION
+      // -------------------------------------------------
+      const minColWidth = 60;
+      const maxColWidth = 160;
+
+      // Estimate width based on header + first 10 rows
+      const colWidths = columns.map(col => {
+        let maxLen = col.length;
+
+        rows.slice(0, 10).forEach(r => {
+          const val = String(r[col] ?? "");
+          if (val.length > maxLen) maxLen = val.length;
+        });
+
+        // Approx width per character
+        const estimated = maxLen * 6.5;
+
+        return Math.max(minColWidth, Math.min(maxColWidth, estimated));
+      });
+
+      // Scale down if exceeds page width
+      const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+      const availableWidth = doc.page.width - 80;
+
+      if (totalWidth > availableWidth) {
+        const scale = availableWidth / totalWidth;
+        for (let i = 0; i < colWidths.length; i++) {
+          colWidths[i] *= scale;
+        }
+      }
+
+      // -------------------------------------------------
+      // 🔹 HEADER DRAW FUNCTION
+      // -------------------------------------------------
+      // ---------- HEADER DRAW FUNCTION (FIXED) ----------
+      const headerHeight = 28;
+
+      const drawHeader = () => {
+        let x = tableX;
+
+        columns.forEach((col, i) => {
+          // 🔵 Header background (ONLY this row)
+          doc
+            .rect(x, tableY, colWidths[i], headerHeight)
+            .fill("#007bff");
+
+          // 🔲 Header border (same table style)
+          doc
+            .rect(x, tableY, colWidths[i], headerHeight)
+            .stroke();
+
+          // Header text
+          doc
+            .fillColor("#ffffff")
+            .font("Helvetica-Bold")
+            .fontSize(9)
+            .text(
+              col.replace(/_/g, " "),
+              x + 6,
+              tableY + 8,
+              {
+                width: colWidths[i] - 12,
+                align: "center",
+                lineBreak: true,
+                wordBreak: false
+              }
+            );
+
+          x += colWidths[i];
+        });
+
+        doc.font("Helvetica").fillColor("#000");
+        tableY += headerHeight;
+      };
+
+
+      // -------------------------------------------------
+      // 🔹 DRAW HEADER
+      // -------------------------------------------------
+      drawHeader();
+
+      // -------------------------------------------------
+      // 🔹 DRAW ROWS
+      // -------------------------------------------------
+      rows.forEach((row, rowIndex) => {
+        if (tableY > pageBottom) {
+          doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
+          tableY = 40;
+          drawHeader();
+        }
+
+        let x = tableX;
+
+        columns.forEach((col, i) => {
+
+          // Zebra background
+          if (rowIndex % 2 === 0) {
+            doc
+              .rect(x, tableY, colWidths[i], rowHeight)
+              .fill("#f9fafb");
+          }
+
+          // Border
+          doc
+            .rect(x, tableY, colWidths[i], rowHeight)
+            .stroke();
+
+          // ✅ FIXED
+          const value = row[col];
+          const isNumber = typeof value === "number";
+
+          doc
+            .fillColor("#000")
+            .fontSize(9)
+            .text(
+              value != null ? String(value) : "",
+              x + 6,
+              tableY + 7,
+              {
+                width: colWidths[i] - 12,
+                ellipsis: true,
+                align: isNumber ? "right" : "left"
+              }
+            );
+
+          x += colWidths[i];
+        });
+
+        tableY += rowHeight;
+      });
+
+      doc.addPage();
+    }
+
+    doc.end();
+
+    // =============================
+    // EMAIL PDF
+    // =============================
+    stream.on("finish", async () => {
+      await transporter.sendMail({
+        to: userEmail,
+        subject: "📄 NLP Report (Insights + Chart + Table)",
+        text: "Your NLP analysis report is attached.",
+        attachments: [
+          {
+            filename: "NLP_Report.pdf",
+            path: filePath
+          }
+        ]
+      });
+
+      // cleanup
+      setTimeout(() => fs.unlinkSync(filePath), 30000);
+
+      res.json({ success: true });
+    });
+
+  } catch (err) {
+    console.error("❌ PDF ERROR:", err);
+    res.status(500).json({ error: "PDF generation failed" });
+  }
+});
+
 
 
 // =============================
