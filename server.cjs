@@ -19,9 +19,16 @@ const cron = require("node-cron");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
 
+function formatMySQLDate(dateString) {
+  if (!dateString) return null;
+  const date = new Date(dateString);
+  if (isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 
 const app = express();
-const port = 5000;
+const port = process.env.PORT || 4000;
 
 require('dotenv').config();
 
@@ -98,12 +105,18 @@ admin.initializeApp({
 // =============================
 // Middleware
 // =============================
-app.use(cors());
-
 app.use(cors({
-  origin: "http://localhost:5173", // or 3000
+  origin: function (origin, callback) {
+    const allowedOrigins = ["http://localhost:5173", "http://localhost:5174"];
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "Authorization-External", "x-api-key"],
+  credentials: true
 }));
 
 app.use(express.json({ limit: '50mb' })); // ✅ allow large JSON payloads
@@ -133,6 +146,37 @@ const db = mysql.createPool({
 
 
 const promiseDb = db.promise();
+
+// =============================
+// DATABASE MIGRATION (SUBSCRIPTION)
+// =============================
+(async () => {
+  try {
+    const [columns] = await db.promise().query("SHOW COLUMNS FROM users");
+    const columnNames = columns.map(c => c.Field);
+    
+    if (!columnNames.includes('subscription_plan')) {
+      await db.promise().query("ALTER TABLE users ADD COLUMN subscription_plan VARCHAR(50) DEFAULT 'Trial'");
+      console.log("✅ Added subscription_plan column");
+    }
+    if (!columnNames.includes('subscription_expiry')) {
+      // Default trial: 3 days from registration. For existing users, we'll give them 3 days from now.
+      await db.promise().query("ALTER TABLE users ADD COLUMN subscription_expiry DATETIME");
+      await db.promise().query("UPDATE users SET subscription_expiry = DATE_ADD(NOW(), INTERVAL 3 DAY) WHERE subscription_expiry IS NULL");
+      console.log("✅ Added subscription_expiry column");
+    }
+    if (!columnNames.includes('activation_key')) {
+      await db.promise().query("ALTER TABLE users ADD COLUMN activation_key VARCHAR(100)");
+      console.log("✅ Added activation_key column");
+    }
+    
+    // Ensure status column can hold new values
+    await db.promise().query("ALTER TABLE users MODIFY COLUMN status VARCHAR(50) DEFAULT 'ACTIVE'");
+    console.log("✅ Updated status column to VARCHAR(50)");
+  } catch (err) {
+    console.error("❌ Migration Error:", err);
+  }
+})();
 
 
 // db.connect((err) => {
@@ -398,8 +442,8 @@ app.post('/register', async (req, res) => {
 
     await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
       [
         firstName,
         lastName,
@@ -414,6 +458,28 @@ app.post('/register', async (req, res) => {
         'Asia/Kolkata' // default timezone
       ]
     );
+
+    // 🔄 Sync with Admin Server
+    try {
+      await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+        firstname: firstName,
+        lastname: lastName,
+        email: normalizedEmail,
+        contact: mobile || '',
+        password: password, // Store password in admin if needed, or hash
+        user_type: 'client',
+        plan: 'Trial',
+        valid_until: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        category: 'individual',
+        company_name: null
+      }, {
+        headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+      });
+      console.log(`✅ Synced ${normalizedEmail} to Admin server`);
+    } catch (syncErr) {
+      console.error(`⚠️ Sync to Admin failed for ${normalizedEmail}:`, syncErr.message);
+      // We don't fail the registration if sync fails, but we log it
+    }
 
     res.json({
       success: true,
@@ -442,10 +508,13 @@ app.post('/company-register', async (req, res) => {
       });
     }
 
+    // ✅ Normalize email
+    const normalizedEmail = email.trim().toLowerCase();
+
     // 🔍 Check if email already exists
     const [existing] = await db
       .promise()
-      .query('SELECT id FROM users WHERE email = ?', [email]);
+      .query('SELECT id FROM users WHERE email = ?', [normalizedEmail]);
 
     if (existing.length > 0) {
       return res.status(409).json({
@@ -466,12 +535,12 @@ app.post('/company-register', async (req, res) => {
     // 💾 INSERT USER
     await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
       [
         firstName,
         lastName,
-        email,
+        normalizedEmail, // Changed from email to normalizedEmail for consistency
         mobile || '',
         hashedPassword,
         company_name,
@@ -483,6 +552,27 @@ app.post('/company-register', async (req, res) => {
       ]
     );
 
+    // 🔄 Sync with Admin Server
+    try {
+      await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+        firstname: firstName,
+        lastname: lastName,
+        email: normalizedEmail,
+        contact: mobile || '',
+        password: password,
+        user_type: role === 'manager' ? 'admin' : 'client',
+        plan: 'Trial',
+        valid_until: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        category: 'company',
+        company_name: company_name
+      }, {
+        headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+      });
+      console.log(`✅ Synced corporate user ${normalizedEmail} to Admin server`);
+    } catch (syncErr) {
+      console.error(`⚠️ Sync to Admin failed for ${normalizedEmail}:`, syncErr.message);
+    }
+
     // 📧 SEND APPROVAL EMAIL ONLY FOR EMPLOYEE
     if (role === 'employee') {
       const [managers] = await db.promise().query(
@@ -492,7 +582,7 @@ app.post('/company-register', async (req, res) => {
 
       if (managers.length > 0) {
         const approveToken = jwt.sign(
-          { email, company_name },
+          { email: normalizedEmail, company_name },
           secret_key,
           { expiresIn: '48h' }
         );
@@ -554,7 +644,8 @@ app.get('/approve-employee', async (req, res) => {
 
 app.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
+    if (email) email = email.trim().toLowerCase();
 
     if (!email || !password) {
       return res.status(400).json({
@@ -567,23 +658,145 @@ app.post('/login', async (req, res) => {
       .promise()
       .query('SELECT * FROM users WHERE email = ?', [email]);
 
+    let user;
     if (rows.length === 0) {
+      // 🔍 FALLBACK: Check Admin Server (New User Sync)
+      try {
+        console.log(`🔍 User ${email} not found locally, checking Admin server...`);
+        const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+
+        if (adminRes.data) {
+          const adminUser = adminRes.data;
+          console.log(`✅ User found in Admin server. Syncing to local DB...`);
+          
+          const syncPassword = adminUser.password || await bcrypt.hash('SyncedUser123!', 10);
+          
+          await db.promise().query(
+            `INSERT INTO users (first_name, last_name, email, mobile, password, company_name, role, status, subscription_plan, subscription_expiry)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
+            [
+              adminUser.firstname,
+              adminUser.lastname,
+              adminUser.email,
+              adminUser.contact || '',
+              syncPassword,
+              adminUser.company_name,
+              adminUser.category === 'company' ? 'manager' : 'personal',
+              adminUser.plan || 'Trial',
+              adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
+            ]
+          );
+          
+          const [newRows] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+          user = newRows[0];
+        }
+      } catch (adminErr) {
+        if (adminErr.response && adminErr.response.status === 404) {
+          console.log(`❌ User ${email} not found in Admin server. Refusing login.`);
+        } else {
+          console.error(`❌ Admin check failed:`, adminErr.message);
+        }
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid credentials'
+        });
+      }
+    } else {
+      user = rows[0];
+      // 🔄 FULL SYNC: Update user detail and status from Admin
+      try {
+        const syncLog = (msg) => {
+          const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
+          console.log(msg);
+          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+        };
+
+        syncLog(`🔄 [Login Sync] Attempting full sync for: ${email}`);
+        const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+
+        if (adminRes.data) {
+          const adminUser = adminRes.data;
+          
+          // Map Admin status to Portal status
+          let portalStatus = 'ACTIVE';
+          const adminStatus = (adminUser.status || '').toLowerCase();
+          if (adminStatus === 'inactive') {
+            portalStatus = 'INACTIVE';
+          } else if (adminStatus === 'expired') {
+            portalStatus = 'EXPIRED';
+          }
+
+          syncLog(`📦 [Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+          
+          await db.promise().query(
+            `UPDATE users SET 
+              subscription_plan = ?, 
+              subscription_expiry = ?, 
+              first_name = ?, 
+              last_name = ?, 
+              mobile = ?, 
+              status = ? 
+             WHERE email = ?`,
+            [
+              adminUser.plan, 
+              formatMySQLDate(adminUser.valid_until), 
+              adminUser.firstname, 
+              adminUser.lastname, 
+              adminUser.contact || '', 
+              portalStatus, 
+              email
+            ]
+          );
+
+          // Update local user object for current session
+          user.subscription_plan = adminUser.plan;
+          user.subscription_expiry = adminUser.valid_until;
+          user.first_name = adminUser.firstname;
+          user.last_name = adminUser.lastname;
+          user.mobile = adminUser.contact || '';
+          user.status = portalStatus;
+
+          syncLog(`✅ [Login Sync] Full sync completed for ${email}`);
+        }
+      } catch (syncErr) {
+        if (syncErr.response && syncErr.response.status === 404) {
+          const syncLog = (msg) => {
+            const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
+            console.log(msg);
+            fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+          };
+          syncLog(`🚨 [Login Sync] User ${email} DELETED remotely. Removing local record.`);
+          await db.promise().query('DELETE FROM users WHERE email = ?', [email]);
+          return res.status(400).json({
+            success: false,
+            error: 'Account no longer exists'
+          });
+        }
+        const errMsg = `❌ [Login Sync] Sync failed for ${email}: ${syncErr.message}`;
+        console.error(errMsg);
+        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), `[${new Date().toISOString()}] ${errMsg}\n`);
+      }
+    }
+
+    if (!user) {
       return res.status(400).json({
         success: false,
         error: 'Invalid credentials'
       });
     }
 
-    const user = rows[0];
-
-    // 🔐 ✅ BLOCK LOGIN ONLY FOR COMPANY EMPLOYEES
-    if (user.role !== 'personal' && user.status !== 'ACTIVE') {
+    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE
+    if (user.status === 'INACTIVE') {
       return res.status(403).json({
         success: false,
         error:
           user.status === 'PENDING'
-            ? 'Account pending manager approval'
-            : 'Account rejected'
+            ? 'Account pending approval'
+            : 'Account is deactivated '
       });
     }
 
@@ -639,7 +852,8 @@ app.post('/login', async (req, res) => {
 });
 app.post('/company-login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
+    if (email) email = email.trim().toLowerCase();
 
     if (!email || !password) {
       return res.status(400).json({
@@ -656,14 +870,135 @@ app.post('/company-login', async (req, res) => {
       [email]
     );
 
+    let user;
     if (rows.length === 0) {
+      // 🔍 FALLBACK: Check Admin Server (Corporate)
+      try {
+        console.log(`🔍 Company User ${email} not found locally, checking Admin server...`);
+        const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+
+        if (adminRes.data) {
+          const adminUser = adminRes.data;
+          console.log(`✅ Company User found in Admin server. Syncing to local DB...`);
+          
+          const syncPassword = adminUser.password || await bcrypt.hash('SyncedUser123!', 10);
+          
+          await db.promise().query(
+            `INSERT INTO users (first_name, last_name, email, mobile, password, company_name, role, status, subscription_plan, subscription_expiry)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
+            [
+              adminUser.firstname,
+              adminUser.lastname,
+              adminUser.email,
+              adminUser.contact || '',
+              syncPassword,
+              adminUser.company_name,
+              adminUser.category === 'company' ? 'manager' : 'personal',
+              adminUser.plan || 'Trial',
+              adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
+            ]
+          );
+          
+          const [newRows] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
+          user = newRows[0];
+        }
+      } catch (adminErr) {
+        if (adminErr.response && adminErr.response.status === 404) {
+          console.log(`❌ Company User ${email} not found in Admin server. Refusing login.`);
+        } else {
+          console.error(`❌ Admin check failed for company login:`, adminErr.message);
+        }
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid credentials'
+        });
+      }
+    } else {
+      user = rows[0];
+      // 🔄 FULL SYNC: For existing company users
+      try {
+        const syncLog = (msg) => {
+          const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
+          console.log(msg);
+          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+        };
+
+        syncLog(`🔄 [Company Login Sync] Attempting sync for: ${email}`);
+        const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+
+        if (adminRes.data) {
+          const adminUser = adminRes.data;
+
+          let portalStatus = 'ACTIVE';
+          if (adminUser.status === 'inactive') {
+            portalStatus = 'INACTIVE';
+          } else if (adminUser.status === 'expired') {
+            portalStatus = 'EXPIRED';
+          }
+
+          syncLog(`📦 [Company Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+          
+          await db.promise().query(
+            `UPDATE users SET 
+              subscription_plan = ?, 
+              subscription_expiry = ?, 
+              first_name = ?, 
+              last_name = ?, 
+              mobile = ?, 
+              status = ? 
+             WHERE email = ?`,
+            [
+              adminUser.plan, 
+              adminUser.valid_until, 
+              adminUser.firstname, 
+              adminUser.lastname, 
+              adminUser.contact || '', 
+              portalStatus, 
+              email
+            ]
+          );
+
+          user.subscription_plan = adminUser.plan;
+          user.subscription_expiry = adminUser.valid_until;
+          user.first_name = adminUser.firstname;
+          user.last_name = adminUser.lastname;
+          user.mobile = adminUser.contact || '';
+          user.status = portalStatus;
+
+          syncLog(`✅ [Company Login Sync] Full sync completed for ${email}`);
+        } else {
+          syncLog(`⚠️ [Company Login Sync] No data returned from Admin for ${email}`);
+        }
+      } catch (syncErr) {
+        if (syncErr.response && syncErr.response.status === 404) {
+          const syncLog = (msg) => {
+            const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
+            console.log(msg);
+            fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+          };
+          syncLog(`🚨 [Company Login Sync] User ${email} DELETED remotely. Removing local record.`);
+          await db.promise().query('DELETE FROM users WHERE email = ?', [email]);
+          return res.status(400).json({
+            success: false,
+            error: 'Account no longer exists'
+          });
+        }
+        const errMsg = `❌ [Company Login Sync] Failed for ${email}: ${syncErr.message}`;
+        console.error(errMsg);
+        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), `[${new Date().toISOString()}] ${errMsg}\n`);
+      }
+    }
+
+    if (!user) {
       return res.status(400).json({
         success: false,
         error: 'Invalid credentials'
       });
     }
-
-    const user = rows[0];
 
     // 🚫 BLOCK PERSONAL USERS
     if (user.role === 'personal') {
@@ -673,14 +1008,14 @@ app.post('/company-login', async (req, res) => {
       });
     }
 
-    // 🔐 ✅ BLOCK LOGIN UNTIL MANAGER APPROVAL
-    if (user.status !== 'ACTIVE') {
+    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE
+    if (user.status === 'INACTIVE') {
       return res.status(403).json({
         success: false,
         error:
           user.status === 'PENDING'
-            ? 'Account pending manager approval'
-            : 'Account rejected'
+            ? 'Account pending approval'
+            : 'Account is deactivated '
       });
     }
 
@@ -1057,7 +1392,7 @@ app.post("/manager/reject-employee", authenticateToken, async (req, res) => {
 
 
 // =============================
-// AUTH MIDDLEWARE (UPDATED)
+// AUTH MIDDLEWARE (UPDATED FOR SUBSCRIPTION)
 // =============================
 function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -1068,24 +1403,74 @@ function authenticateToken(req, res, next) {
 
   const token = authHeader.split(" ")[1];
 
-  jwt.verify(token, secret_key, (err, decoded) => {
+  jwt.verify(token, secret_key, async (err, decoded) => {
     if (err) {
       return res.status(403).json({ error: "Invalid token" });
     }
 
-    // ✅ FINAL USER CONTEXT
-    req.user = {
-      id: decoded.id,                         // user id
-      email: decoded.email,
-      role: decoded.role || "personal",       // 🔥 ADD (VERY IMPORTANT)
-      company_name: decoded.company_name || null,
-      viewOnly: decoded.viewOnly || false
-    };
+    try {
+      // 🔥 Fetch latest status and subscription
+      const [rows] = await db.promise().query(
+        "SELECT role, status, subscription_expiry, subscription_plan FROM users WHERE id = ?",
+        [decoded.id]
+      );
 
-    next();
+      if (rows.length === 0) {
+        return res.status(401).json({ error: "User no longer exists" });
+      }
+
+      const u = rows[0];
+
+      // 🚫 BLOCK IF INACTIVE
+      if (u.status === 'INACTIVE') {
+        return res.status(403).json({ 
+          error: "Account is deactivated. Please contact support.",
+          accountInactive: true 
+        });
+      }
+
+      let isSubscriptionActive = true;
+      let plan = u.subscription_plan;
+      let expiry = u.subscription_expiry;
+
+      // Subscription check for personal users or Expired status
+      if (u.role === 'personal' || u.status === 'EXPIRED') {
+        if (!u.subscription_expiry || new Date(u.subscription_expiry) < new Date() || u.status === 'EXPIRED') {
+          isSubscriptionActive = false;
+        }
+      }
+
+      req.user = {
+        id: decoded.id,
+        email: decoded.email,
+        role: decoded.role || "personal",
+        company_name: decoded.company_name || null,
+        viewOnly: decoded.viewOnly || false,
+        isSubscriptionActive,
+        subscription_plan: plan,
+        subscription_expiry: expiry,
+        status: u.status
+      };
+
+      next();
+    } catch (dbErr) {
+      console.error("Auth Middleware DB Error:", dbErr);
+      return res.status(500).json({ error: "Internal server error during authentication" });
+    }
   });
 }
-app.get("/fetch-api", authenticateToken, async (req, res) => {
+
+// 🛡️ SUBSCRIPTION GUARD
+function checkSubscription(req, res, next) {
+  if (!req.user.isSubscriptionActive) {
+    return res.status(403).json({ 
+      error: "Subscription expired. Please activate a new plan.",
+      subscriptionExpired: true 
+    });
+  }
+  next();
+}
+app.get("/fetch-api", authenticateToken, checkSubscription, async (req, res) => {
   try {
     if (req.user.viewOnly) {
       return res.status(403).json({ error: "View-only access" });
@@ -1114,7 +1499,7 @@ app.get("/fetch-api", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Fetch failed" });
   }
 });
-app.post("/fetch-api", authenticateToken, async (req, res) => {
+app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) => {
   try {
     if (req.user.viewOnly) {
       return res.status(403).json({ error: "View-only access" });
@@ -1198,7 +1583,7 @@ app.post("/fetch-api", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/save-api-data", authenticateToken, async (req, res) => {
+app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res) => {
   try {
     if (req.user.viewOnly) {
       return res.status(403).json({ error: "View-only access" });
@@ -1393,7 +1778,7 @@ cron.schedule("*/5 * * * *", async () => {
 // =======================================================
 // 📊 UPDATE DAILY REPORT TIME
 // =======================================================
-app.post("/api/report-time", async (req, res) => {
+app.post("/api/report-time", authenticateToken, checkSubscription, async (req, res) => {
   const { email, hour, minute, timezone } = req.body;
 
   try {
@@ -1839,7 +2224,7 @@ function safeFileName(name) {
 // /upload ROUTE (CLEAN FINAL VERSION)
 // ======================
 
-app.post("/upload", authenticateToken, (req, res, next) => {
+app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
   if (req.user.viewOnly) {
     return res.status(403).json({ error: "View-only users cannot upload files" });
   }
@@ -2466,7 +2851,7 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
 // =============================
 // ✅ GROQ CHAT API (DATA AWARE)
 // =============================
-app.post("/api/chat", authenticateToken, async (req, res) => {
+app.post("/api/chat", authenticateToken, checkSubscription, async (req, res) => {
   try {
     const { question } = req.body;
     const { id: userId, company_name } = req.user;
@@ -2781,7 +3166,7 @@ function safeParseJSON(text) {
 // =============================
 // 🧠 NLP QUERY ROUTE (SECURE)
 // =============================
-app.post("/nlp/query", authenticateToken, async (req, res) => {
+app.post("/nlp/query", authenticateToken, checkSubscription, async (req, res) => {
   try {
     const { question, forceMode } = req.body;
 
@@ -3048,7 +3433,7 @@ User Question:
   }
 });
 
-app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
+app.post("/nlp/send-pdf", authenticateToken, checkSubscription, async (req, res) => {
   try {
     const { question, tables } = req.body;
     const userEmail = req.user.email;
@@ -3329,287 +3714,136 @@ app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/nlp/send-pdf", authenticateToken, async (req, res) => {
-  try {
-    const { question, tables } = req.body;
-    const userEmail = req.user.email;
 
-    if (!question || !tables || !Array.isArray(tables)) {
-      return res.status(400).json({ error: "Invalid payload" });
+
+// =============================
+// SUBSCRIPTION ENDPOINTS
+// =============================
+
+app.get("/api/subscription-status", authenticateToken, (req, res) => {
+  res.json({
+    success: true,
+    plan: req.user.subscription_plan,
+    expiry: req.user.subscription_expiry,
+    isActive: req.user.isSubscriptionActive,
+    status: req.user.status
+  });
+});
+
+app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key) return res.status(400).json({ error: "Activation key required" });
+
+    let daysToAdd = 0;
+    let planName = "";
+
+    if (key === "CLOUD360-TRIAL") { daysToAdd = 3; planName = "Trial"; }
+    else if (key === "CLOUD360-1M") { daysToAdd = 30; planName = "1 Month"; }
+    else if (key === "CLOUD360-3M") { daysToAdd = 90; planName = "3 Months"; }
+    else if (key === "CLOUD360-6M") { daysToAdd = 180; planName = "6 Months"; }
+    else if (key === "CLOUD360-1Y") { daysToAdd = 365; planName = "1 Year"; }
+    else {
+      return res.status(400).json({ error: "Invalid activation key" });
     }
 
-    const filePath = path.join(
-      __dirname,
-      "uploads",
-      `NLP_Report_${Date.now()}.pdf`
+    const [existing] = await db.promise().query(
+       "SELECT subscription_expiry FROM users WHERE id = ?", [req.user.id]
     );
 
-    const doc = new PDFDocument({ size: "A4", margin: 40 });
-    const stream = fs.createWriteStream(filePath);
-    doc.pipe(stream);
-
-    // =============================
-    // HEADER
-    // =============================
-    doc.fontSize(18).text("NLP Analysis Report", { align: "center" });
-    doc.moveDown();
-    doc.fontSize(12).text(`Question: ${question}`);
-    doc.text(`Generated for: ${userEmail}`);
-    doc.moveDown(2);
-
-    // =============================
-    // LOOP EACH DATASET
-    // =============================
-    for (const block of tables) {
-      const { table, insights, rows, chartImage } = block;
-
-      // ---------- DATASET TITLE ----------
-      doc.fontSize(14).text(table.toUpperCase(), { underline: true });
-      doc.moveDown();
-
-      // ---------- INSIGHTS ----------
-      // =============================
-      // 🧠 INSIGHTS BOX (DESIGNED)
-      // =============================
-      doc.fontSize(13).fillColor("#000").text("Insights");
-      doc.moveDown(0.5);
-
-      // Box dimensions
-      const boxX = doc.x;
-      const boxY = doc.y;
-      const boxWidth = doc.page.width - 80;
-      const boxPadding = 10;
-
-      // Calculate box height dynamically
-      const boxHeight = insights.length * 16 + boxPadding * 2;
-
-      // Draw background box
-      doc
-        .rect(boxX, boxY, boxWidth, boxHeight)
-        .fill("#f3f4f6");
-
-      // Write insights text
-      doc.fillColor("#000").fontSize(10);
-
-      let textY = boxY + boxPadding;
-      insights.forEach((i, idx) => {
-        doc.text(`${idx + 1}. ${i}`, boxX + boxPadding, textY, {
-          width: boxWidth - boxPadding * 2
-        });
-        textY += 16;
-      });
-
-      // Move cursor below box
-      doc.y = boxY + boxHeight + 15;
-
-
-      // ---------- CHART ----------
-      // Move cursor below insights box
-      doc.y = boxY + boxHeight + 20;
-
-      // =============================
-      // 📊 CHART (SAME PAGE, BELOW INSIGHTS)
-      // =============================
-      if (chartImage) {
-        const base64 = chartImage.replace(/^data:image\/png;base64,/, "");
-        const imgBuffer = Buffer.from(base64, "base64");
-
-        const chartWidth = doc.page.width - 80;
-        const chartHeight = 260;
-
-        // Auto page break safety
-        if (doc.y + chartHeight > doc.page.height - 40) {
-          doc.addPage();
-        }
-
-        doc.fontSize(12).fillColor("#000").text("Chart Analysis");
-        doc.moveDown(0.5);
-
-        doc.image(imgBuffer, {
-          fit: [chartWidth, chartHeight],
-          align: "center"
-        });
-
-        doc.moveDown(1.5);
-      }
-
-      // =============================
-      // 📋 TABLE DESIGN (LIKE UI)
-      // =============================
-      doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
-
-      const columns = Object.keys(rows[0]);
-
-      const tableX = 40;
-      let tableY = doc.y;
-      const rowHeight = 22;
-      const pageBottom = doc.page.height - 50;
-
-      // -------------------------------------------------
-      // 🔹 AUTO COLUMN WIDTH CALCULATION
-      // -------------------------------------------------
-      const minColWidth = 60;
-      const maxColWidth = 160;
-
-      // Estimate width based on header + first 10 rows
-      const colWidths = columns.map(col => {
-        let maxLen = col.length;
-
-        rows.slice(0, 10).forEach(r => {
-          const val = String(r[col] ?? "");
-          if (val.length > maxLen) maxLen = val.length;
-        });
-
-        // Approx width per character
-        const estimated = maxLen * 6.5;
-
-        return Math.max(minColWidth, Math.min(maxColWidth, estimated));
-      });
-
-      // Scale down if exceeds page width
-      const totalWidth = colWidths.reduce((a, b) => a + b, 0);
-      const availableWidth = doc.page.width - 80;
-
-      if (totalWidth > availableWidth) {
-        const scale = availableWidth / totalWidth;
-        for (let i = 0; i < colWidths.length; i++) {
-          colWidths[i] *= scale;
-        }
-      }
-
-      // -------------------------------------------------
-      // 🔹 HEADER DRAW FUNCTION
-      // -------------------------------------------------
-      // ---------- HEADER DRAW FUNCTION (FIXED) ----------
-      const headerHeight = 28;
-
-      const drawHeader = () => {
-        let x = tableX;
-
-        columns.forEach((col, i) => {
-          // 🔵 Header background (ONLY this row)
-          doc
-            .rect(x, tableY, colWidths[i], headerHeight)
-            .fill("#007bff");
-
-          // 🔲 Header border (same table style)
-          doc
-            .rect(x, tableY, colWidths[i], headerHeight)
-            .stroke();
-
-          // Header text
-          doc
-            .fillColor("#ffffff")
-            .font("Helvetica-Bold")
-            .fontSize(9)
-            .text(
-              col.replace(/_/g, " "),
-              x + 6,
-              tableY + 8,
-              {
-                width: colWidths[i] - 12,
-                align: "center",
-                lineBreak: true,
-                wordBreak: false
-              }
-            );
-
-          x += colWidths[i];
-        });
-
-        doc.font("Helvetica").fillColor("#000");
-        tableY += headerHeight;
-      };
-
-
-      // -------------------------------------------------
-      // 🔹 DRAW HEADER
-      // -------------------------------------------------
-      drawHeader();
-
-      // -------------------------------------------------
-      // 🔹 DRAW ROWS
-      // -------------------------------------------------
-      rows.forEach((row, rowIndex) => {
-        if (tableY > pageBottom) {
-          doc.addPage({ size: "A4", layout: "landscape", margin: 40 });
-          tableY = 40;
-          drawHeader();
-        }
-
-        let x = tableX;
-
-        columns.forEach((col, i) => {
-
-          // Zebra background
-          if (rowIndex % 2 === 0) {
-            doc
-              .rect(x, tableY, colWidths[i], rowHeight)
-              .fill("#f9fafb");
-          }
-
-          // Border
-          doc
-            .rect(x, tableY, colWidths[i], rowHeight)
-            .stroke();
-
-          // ✅ FIXED
-          const value = row[col];
-          const isNumber = typeof value === "number";
-
-          doc
-            .fillColor("#000")
-            .fontSize(9)
-            .text(
-              value != null ? String(value) : "",
-              x + 6,
-              tableY + 7,
-              {
-                width: colWidths[i] - 12,
-                ellipsis: true,
-                align: isNumber ? "right" : "left"
-              }
-            );
-
-          x += colWidths[i];
-        });
-
-        tableY += rowHeight;
-      });
-
-      doc.addPage();
+    let currentExpiry = new Date();
+    if (existing[0].subscription_expiry && new Date(existing[0].subscription_expiry) > new Date()) {
+        currentExpiry = new Date(existing[0].subscription_expiry);
     }
 
-    doc.end();
+    const newExpiry = new Date(currentExpiry.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
 
-    // =============================
-    // EMAIL PDF
-    // =============================
-    stream.on("finish", async () => {
-      await transporter.sendMail({
-        to: userEmail,
-        subject: "📄 NLP Report (Insights + Chart + Table)",
-        text: "Your NLP analysis report is attached.",
-        attachments: [
-          {
-            filename: "NLP_Report.pdf",
-            path: filePath
-          }
-        ]
-      });
+    await db.promise().query(
+      "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ? WHERE id = ?",
+      [planName, newExpiry, key, req.user.id]
+    );
 
-      // cleanup
-      setTimeout(() => fs.unlinkSync(filePath), 30000);
-
-      res.json({ success: true });
+    res.json({
+      success: true,
+      message: `Successfully activated ${planName} plan!`,
+      plan: planName,
+      expiry: newExpiry
     });
-
   } catch (err) {
-    console.error("❌ PDF ERROR:", err);
-    res.status(500).json({ error: "PDF generation failed" });
+    console.error("Activation Error:", err);
+    res.status(500).json({ error: "Failed to activate subscription" });
   }
 });
 
+app.post("/api/sync-user-from-admin", async (req, res) => {
+  try {
+    const apiKey = req.headers['x-api-key'];
+    if (!apiKey || apiKey !== process.env.API_BRIDGE_KEY) {
+      return res.status(403).json({ error: "Unauthorized bridge access" });
+    }
+
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    
+    // Log the incoming sync request
+    const syncLog = (msg) => {
+      const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
+      console.log(msg);
+      fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+    };
+
+    syncLog(`🔄 [Remote Sync] Incoming sync for: ${normalizedEmail}`);
+
+    const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${normalizedEmail}`, {
+      headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+    });
+
+    if (adminRes.data) {
+      const adminUser = adminRes.data;
+      
+      // Map Admin status to Portal status
+      let portalStatus = 'ACTIVE';
+      const adminStatus = (adminUser.status || '').toLowerCase();
+      if (adminStatus === 'inactive') {
+        portalStatus = 'INACTIVE';
+      } else if (adminStatus === 'expired') {
+        portalStatus = 'EXPIRED';
+      }
+
+      await db.promise().query(
+        `UPDATE users SET 
+          subscription_plan = ?, 
+          subscription_expiry = ?, 
+          first_name = ?, 
+          last_name = ?, 
+          mobile = ?, 
+          status = ? 
+         WHERE email = ?`,
+        [
+          adminUser.plan, 
+          formatMySQLDate(adminUser.valid_until), 
+          adminUser.firstname, 
+          adminUser.lastname, 
+          adminUser.contact || '', 
+          portalStatus, 
+          normalizedEmail
+        ]
+      );
+
+      syncLog(`✅ [Remote Sync] Successfully updated ${normalizedEmail}`);
+      res.json({ success: true, message: "User synced successfully" });
+    } else {
+      res.status(404).json({ error: "User not found in Admin server" });
+    }
+  } catch (err) {
+    console.error("Sync Error:", err.message);
+    res.status(500).json({ error: "Failed to sync user" });
+  }
+});
 
 
 // =============================
