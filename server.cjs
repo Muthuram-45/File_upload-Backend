@@ -154,7 +154,7 @@ const promiseDb = db.promise();
   try {
     const [columns] = await db.promise().query("SHOW COLUMNS FROM users");
     const columnNames = columns.map(c => c.Field);
-    
+
     if (!columnNames.includes('subscription_plan')) {
       await db.promise().query("ALTER TABLE users ADD COLUMN subscription_plan VARCHAR(50) DEFAULT 'Trial'");
       console.log("✅ Added subscription_plan column");
@@ -169,7 +169,7 @@ const promiseDb = db.promise();
       await db.promise().query("ALTER TABLE users ADD COLUMN activation_key VARCHAR(100)");
       console.log("✅ Added activation_key column");
     }
-    
+
     // Ensure status column can hold new values
     await db.promise().query("ALTER TABLE users MODIFY COLUMN status VARCHAR(50) DEFAULT 'ACTIVE'");
     console.log("✅ Updated status column to VARCHAR(50)");
@@ -670,9 +670,9 @@ app.post('/login', async (req, res) => {
         if (adminRes.data) {
           const adminUser = adminRes.data;
           console.log(`✅ User found in Admin server. Syncing to local DB...`);
-          
+
           const syncPassword = adminUser.password || await bcrypt.hash('SyncedUser123!', 10);
-          
+
           await db.promise().query(
             `INSERT INTO users (first_name, last_name, email, mobile, password, company_name, role, status, subscription_plan, subscription_expiry)
              VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
@@ -688,7 +688,7 @@ app.post('/login', async (req, res) => {
               adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
             ]
           );
-          
+
           const [newRows] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
           user = newRows[0];
         }
@@ -720,18 +720,20 @@ app.post('/login', async (req, res) => {
 
         if (adminRes.data) {
           const adminUser = adminRes.data;
-          
+
           // Map Admin status to Portal status
-          let portalStatus = 'ACTIVE';
+          let portalStatus = user.status; // Default to local status to preserve PENDING
           const adminStatus = (adminUser.status || '').toLowerCase();
           if (adminStatus === 'inactive') {
             portalStatus = 'INACTIVE';
           } else if (adminStatus === 'expired') {
             portalStatus = 'EXPIRED';
+          } else if (adminStatus === 'active' && user.status !== 'PENDING') {
+            portalStatus = 'ACTIVE';
           }
 
           syncLog(`📦 [Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
-          
+
           await db.promise().query(
             `UPDATE users SET 
               subscription_plan = ?, 
@@ -742,12 +744,12 @@ app.post('/login', async (req, res) => {
               status = ? 
              WHERE email = ?`,
             [
-              adminUser.plan, 
-              formatMySQLDate(adminUser.valid_until), 
-              adminUser.firstname, 
-              adminUser.lastname, 
-              adminUser.contact || '', 
-              portalStatus, 
+              adminUser.plan,
+              formatMySQLDate(adminUser.valid_until),
+              adminUser.firstname,
+              adminUser.lastname,
+              adminUser.contact || '',
+              portalStatus,
               email
             ]
           );
@@ -789,14 +791,18 @@ app.post('/login', async (req, res) => {
       });
     }
 
-    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE
-    if (user.status === 'INACTIVE') {
+    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE OR EXPIRED
+    if (user.status !== 'ACTIVE' && user.status !== 'EXPIRED') {
+      let errorMessage = 'Account is deactivated';
+      if (user.status === 'PENDING') {
+        errorMessage = 'Account pending approval';
+      } else if (user.status === 'REJECTED') {
+        errorMessage = 'Account rejected';
+      }
+
       return res.status(403).json({
         success: false,
-        error:
-          user.status === 'PENDING'
-            ? 'Account pending approval'
-            : 'Account is deactivated '
+        error: errorMessage
       });
     }
 
@@ -826,6 +832,14 @@ app.post('/login', async (req, res) => {
       { expiresIn: '24h' }
     );
 
+    // Compute subscription status for login response
+    let isSubscriptionActive = true;
+    if (user.role === 'personal' || user.status === 'EXPIRED') {
+      if (!user.subscription_expiry || new Date(user.subscription_expiry) < new Date() || user.status === 'EXPIRED') {
+        isSubscriptionActive = false;
+      }
+    }
+
     res.json({
       success: true,
       message: '✅ Login successful',
@@ -838,7 +852,11 @@ app.post('/login', async (req, res) => {
         mobile: user.mobile,
         role: user.role,
         company_name: user.company_name || null,
-        lastLogin: now
+        lastLogin: now,
+        subscription_plan: user.subscription_plan || null,
+        subscription_expiry: user.subscription_expiry || null,
+        status: user.status || 'ACTIVE',
+        isSubscriptionActive
       }
     });
 
@@ -864,7 +882,7 @@ app.post('/company-login', async (req, res) => {
 
     const [rows] = await db.promise().query(
       `SELECT id, first_name, last_name, email, password,
-              company_name, mobile, role, status
+              company_name, mobile, role, status, subscription_plan, subscription_expiry
        FROM users
        WHERE email = ?`,
       [email]
@@ -882,9 +900,9 @@ app.post('/company-login', async (req, res) => {
         if (adminRes.data) {
           const adminUser = adminRes.data;
           console.log(`✅ Company User found in Admin server. Syncing to local DB...`);
-          
+
           const syncPassword = adminUser.password || await bcrypt.hash('SyncedUser123!', 10);
-          
+
           await db.promise().query(
             `INSERT INTO users (first_name, last_name, email, mobile, password, company_name, role, status, subscription_plan, subscription_expiry)
              VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)`,
@@ -900,7 +918,7 @@ app.post('/company-login', async (req, res) => {
               adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
             ]
           );
-          
+
           const [newRows] = await db.promise().query('SELECT * FROM users WHERE email = ?', [email]);
           user = newRows[0];
         }
@@ -933,15 +951,19 @@ app.post('/company-login', async (req, res) => {
         if (adminRes.data) {
           const adminUser = adminRes.data;
 
-          let portalStatus = 'ACTIVE';
-          if (adminUser.status === 'inactive') {
+          // Map Admin status to Portal status
+          let portalStatus = user.status; // Default to local status to preserve PENDING
+          const adminStatus = (adminUser.status || '').toLowerCase();
+          if (adminStatus === 'inactive') {
             portalStatus = 'INACTIVE';
-          } else if (adminUser.status === 'expired') {
+          } else if (adminStatus === 'expired') {
             portalStatus = 'EXPIRED';
+          } else if (adminStatus === 'active' && user.status !== 'PENDING') {
+            portalStatus = 'ACTIVE';
           }
 
           syncLog(`📦 [Company Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
-          
+
           await db.promise().query(
             `UPDATE users SET 
               subscription_plan = ?, 
@@ -952,12 +974,12 @@ app.post('/company-login', async (req, res) => {
               status = ? 
              WHERE email = ?`,
             [
-              adminUser.plan, 
-              adminUser.valid_until, 
-              adminUser.firstname, 
-              adminUser.lastname, 
-              adminUser.contact || '', 
-              portalStatus, 
+              adminUser.plan,
+              adminUser.valid_until,
+              adminUser.firstname,
+              adminUser.lastname,
+              adminUser.contact || '',
+              portalStatus,
               email
             ]
           );
@@ -1008,14 +1030,18 @@ app.post('/company-login', async (req, res) => {
       });
     }
 
-    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE
-    if (user.status === 'INACTIVE') {
+    // 🔐 ✅ BLOCK LOGIN IF STATUS IS NOT ACTIVE OR EXPIRED
+    if (user.status !== 'ACTIVE' && user.status !== 'EXPIRED') {
+      let errorMessage = 'Account is deactivated';
+      if (user.status === 'PENDING') {
+        errorMessage = 'Account pending manager approval';
+      } else if (user.status === 'REJECTED') {
+        errorMessage = 'Account rejected';
+      }
+
       return res.status(403).json({
         success: false,
-        error:
-          user.status === 'PENDING'
-            ? 'Account pending approval'
-            : 'Account is deactivated '
+        error: errorMessage
       });
     }
 
@@ -1045,6 +1071,14 @@ app.post('/company-login', async (req, res) => {
       { expiresIn: '24h' }
     );
 
+    // Compute subscription status for login response
+    let isSubscriptionActive = true;
+    if (user.role === 'personal' || user.status === 'EXPIRED') {
+      if (!user.subscription_expiry || new Date(user.subscription_expiry) < new Date() || user.status === 'EXPIRED') {
+        isSubscriptionActive = false;
+      }
+    }
+
     res.json({
       success: true,
       message: '✅ Company login successful',
@@ -1057,7 +1091,11 @@ app.post('/company-login', async (req, res) => {
         role: user.role,
         company_name: user.company_name,
         mobile: user.mobile,
-        lastLogin: now
+        lastLogin: now,
+        subscription_plan: user.subscription_plan || null,
+        subscription_expiry: user.subscription_expiry || null,
+        status: user.status || 'ACTIVE',
+        isSubscriptionActive
       }
     });
 
@@ -1267,6 +1305,14 @@ app.post('/google-login', async (req, res) => {
       { expiresIn: '24h' }
     );
 
+    // Compute subscription status for login response
+    let isSubscriptionActive = true;
+    if (user.role === 'personal' || user.status === 'EXPIRED') {
+      if (!user.subscription_expiry || new Date(user.subscription_expiry) < new Date() || user.status === 'EXPIRED') {
+        isSubscriptionActive = false;
+      }
+    }
+
     res.json({
       success: true,
       message: '✅ Google Sign-In successful',
@@ -1279,7 +1325,11 @@ app.post('/google-login', async (req, res) => {
         role: user.role,
         company_name: user.company_name || null,
         picture,
-        lastLogin: new Date()
+        lastLogin: new Date(),
+        subscription_plan: user.subscription_plan || null,
+        subscription_expiry: user.subscription_expiry || null,
+        status: user.status || 'ACTIVE',
+        isSubscriptionActive
       }
     });
   } catch (err) {
@@ -1423,9 +1473,9 @@ function authenticateToken(req, res, next) {
 
       // 🚫 BLOCK IF INACTIVE
       if (u.status === 'INACTIVE') {
-        return res.status(403).json({ 
+        return res.status(403).json({
           error: "Account is deactivated. Please contact support.",
-          accountInactive: true 
+          accountInactive: true
         });
       }
 
@@ -1463,9 +1513,9 @@ function authenticateToken(req, res, next) {
 // 🛡️ SUBSCRIPTION GUARD
 function checkSubscription(req, res, next) {
   if (!req.user.isSubscriptionActive) {
-    return res.status(403).json({ 
+    return res.status(403).json({
       error: "Subscription expired. Please activate a new plan.",
-      subscriptionExpired: true 
+      subscriptionExpired: true
     });
   }
   next();
@@ -3748,12 +3798,12 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     }
 
     const [existing] = await db.promise().query(
-       "SELECT subscription_expiry FROM users WHERE id = ?", [req.user.id]
+      "SELECT subscription_expiry FROM users WHERE id = ?", [req.user.id]
     );
 
     let currentExpiry = new Date();
     if (existing[0].subscription_expiry && new Date(existing[0].subscription_expiry) > new Date()) {
-        currentExpiry = new Date(existing[0].subscription_expiry);
+      currentExpiry = new Date(existing[0].subscription_expiry);
     }
 
     const newExpiry = new Date(currentExpiry.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
@@ -3788,7 +3838,7 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-    
+
     // Log the incoming sync request
     const syncLog = (msg) => {
       const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
@@ -3804,7 +3854,7 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
 
     if (adminRes.data) {
       const adminUser = adminRes.data;
-      
+
       // Map Admin status to Portal status
       let portalStatus = 'ACTIVE';
       const adminStatus = (adminUser.status || '').toLowerCase();
@@ -3824,12 +3874,12 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
           status = ? 
          WHERE email = ?`,
         [
-          adminUser.plan, 
-          formatMySQLDate(adminUser.valid_until), 
-          adminUser.firstname, 
-          adminUser.lastname, 
-          adminUser.contact || '', 
-          portalStatus, 
+          adminUser.plan,
+          formatMySQLDate(adminUser.valid_until),
+          adminUser.firstname,
+          adminUser.lastname,
+          adminUser.contact || '',
+          portalStatus,
           normalizedEmail
         ]
       );
