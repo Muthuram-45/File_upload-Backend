@@ -440,7 +440,8 @@ app.post('/register', async (req, res) => {
     const company_name = null;
     const status = 'ACTIVE';
 
-    await db.promise().query(
+    // 💾 INSERT USER
+    const [result] = await db.promise().query(
       `INSERT INTO users
        (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
@@ -459,9 +460,12 @@ app.post('/register', async (req, res) => {
       ]
     );
 
+    const userId = result.insertId;
+
     // 🔄 Sync with Admin Server
     try {
       await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+        id: userId,
         firstname: firstName,
         lastname: lastName,
         email: normalizedEmail,
@@ -475,7 +479,7 @@ app.post('/register', async (req, res) => {
       }, {
         headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
       });
-      console.log(`✅ Synced ${normalizedEmail} to Admin server`);
+      console.log(`✅ Synced ${normalizedEmail} (ID: ${userId}) to Admin server`);
     } catch (syncErr) {
       console.error(`⚠️ Sync to Admin failed for ${normalizedEmail}:`, syncErr.message);
       // We don't fail the registration if sync fails, but we log it
@@ -533,7 +537,7 @@ app.post('/company-register', async (req, res) => {
     const status = role === 'employee' ? 'PENDING' : 'ACTIVE';
 
     // 💾 INSERT USER
-    await db.promise().query(
+    const [result] = await db.promise().query(
       `INSERT INTO users
        (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
@@ -552,9 +556,12 @@ app.post('/company-register', async (req, res) => {
       ]
     );
 
+    const userId = result.insertId;
+
     // 🔄 Sync with Admin Server
     try {
       await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+        id: userId,
         firstname: firstName,
         lastname: lastName,
         email: normalizedEmail,
@@ -568,7 +575,7 @@ app.post('/company-register', async (req, res) => {
       }, {
         headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
       });
-      console.log(`✅ Synced corporate user ${normalizedEmail} to Admin server`);
+      console.log(`✅ Synced corporate user ${normalizedEmail} (ID: ${userId}) to Admin server`);
     } catch (syncErr) {
       console.error(`⚠️ Sync to Admin failed for ${normalizedEmail}:`, syncErr.message);
     }
@@ -1461,7 +1468,7 @@ function authenticateToken(req, res, next) {
     try {
       // 🔥 Fetch latest status and subscription
       const [rows] = await db.promise().query(
-        "SELECT role, status, subscription_expiry, subscription_plan FROM users WHERE id = ?",
+        "SELECT id, first_name, last_name, role, status, subscription_expiry, subscription_plan FROM users WHERE id = ?",
         [decoded.id]
       );
 
@@ -1492,8 +1499,10 @@ function authenticateToken(req, res, next) {
 
       req.user = {
         id: decoded.id,
+        first_name: u.first_name,
+        last_name: u.last_name,
         email: decoded.email,
-        role: decoded.role || "personal",
+        role: u.role || "personal",
         company_name: decoded.company_name || null,
         viewOnly: decoded.viewOnly || false,
         isSubscriptionActive,
@@ -3770,6 +3779,165 @@ app.post("/nlp/send-pdf", authenticateToken, checkSubscription, async (req, res)
 // SUBSCRIPTION ENDPOINTS
 // =============================
 
+// =============================
+// 🎫 SUPPORT TICKETS (PROXY TO ADMIN)
+// =============================
+app.get("/api/client-tickets", authenticateToken, async (req, res) => {
+  try {
+    // 1️⃣ Need to get the admin user ID by email
+    const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${req.user.email}`, {
+      headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+    });
+
+    if (!adminRes.data || !adminRes.data.id) {
+      return res.status(404).json({ error: "Admin user not found for sync" });
+    }
+
+    const adminUserId = adminRes.data.id;
+
+    // 2️⃣ Fetch tickets from admin server
+    const ticketsRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/tickets/client/${adminUserId}`);
+    res.json(ticketsRes.data);
+  } catch (err) {
+    console.error("❌ Fetch Tickets Error:", err.message);
+    res.status(500).json({ error: "Failed to fetch tickets from support server" });
+  }
+});
+
+app.post("/api/client-tickets", authenticateToken, async (req, res) => {
+  try {
+    const { subject, issue, category, priority } = req.body;
+
+    // 1️⃣ Get admin user ID
+    const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${req.user.email}`, {
+      headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+    });
+
+    if (!adminRes.data || !adminRes.data.id) {
+      return res.status(404).json({ error: "Admin user not found for sync" });
+    }
+
+    const adminUserId = adminRes.data.id;
+
+    // 2️⃣ Create ticket on admin server
+    const createRes = await axios.post(`${process.env.ADMIN_SERVER_URL}/api/tickets`, {
+      client_id: adminUserId,
+      subject,
+      issue,
+      category,
+      priority
+    });
+
+    res.status(201).json(createRes.data);
+  } catch (err) {
+    console.error("❌ Create Ticket Error:", err.message);
+    res.status(500).json({ error: "Failed to submit ticket" });
+  }
+});
+
+app.post("/api/subscription-request", authenticateToken, async (req, res) => {
+  try {
+    const { plan } = req.body;
+    const { id, first_name, last_name, email } = req.user;
+
+    const userName = `${first_name || ''} ${last_name || ''}`.trim() || 'Valued User';
+
+    // 1️⃣ Send Email to Admin
+    const mailOptions = {
+      from: `"Cloud360 Subscription" <${process.env.EMAIL_USER || 'muthuram921@gmail.com'}>`,
+      to: 'muthuram921@gmail.com',
+      subject: `🚀 New Subscription Request: ${plan}`,
+      html: `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; }
+                .container { max-width: 600px; margin: 20px auto; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+                .header { background: linear-gradient(135deg, #2563eb, #1e40af); color: #fff; padding: 30px; text-align: center; }
+                .header h1 { margin: 0; font-size: 24px; letter-spacing: 1px; }
+                .content { padding: 30px; background-color: #fff; }
+                .details-box { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 20px; margin: 20px 0; }
+                .detail-item { margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #edf2f7; }
+                .detail-item:last-child { border-bottom: none; }
+                .label { font-weight: 600; color: #4a5568; width: 140px; display: inline-block; }
+                .value { color: #2d3748; font-weight: 500; }
+                .plan-badge { display: inline-block; padding: 4px 12px; border-radius: 20px; background-color: #e0e7ff; color: #3730a3; font-weight: 600; font-size: 14px; }
+                .footer { background-color: #f8fafc; padding: 20px; text-align: center; font-size: 13px; color: #64748b; border-top: 1px solid #e2e8f0; }
+                .btn { display: inline-block; padding: 12px 24px; background-color: #2563eb; color: #ffffff !important; text-decoration: none; border-radius: 6px; font-weight: 600; margin-top: 20px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Subscription Request</h1>
+                </div>
+                <div class="content">
+                    <p>Hello Admin,</p>
+                    <p>A new subscription request has been received from the Cloud360 Portal. Here are the user details:</p>
+                    
+                    <div class="details-box">
+                        <div class="detail-item">
+                            <span class="label">User Name:</span>
+                            <span class="value">${userName}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="label">Email Address:</span>
+                            <span class="value">${email}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="label">User ID:</span>
+                            <span class="value">#${id}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="label">Requested Plan:</span>
+                            <span class="plan-badge">${plan}</span>
+                        </div>
+                    </div>
+                    
+                    <p>You can manage this request by clicking the button below to open the Admin Dashboard.</p>
+                    
+                    <div style="text-align: center;">
+                        <a href="${process.env.ADMIN_DASHBOARD_URL || 'http://localhost:5173'}/requests" class="btn">View in Dashboard</a>
+                    </div>
+                </div>
+                <div class="footer">
+                    This is an automated notification from Cloud360 Platform.
+                </div>
+            </div>
+        </body>
+        </html>
+      `
+    };
+
+    await transporter.sendMail(mailOptions);
+    console.log(`📧 Subscription request email sent for ${email} (${plan})`);
+
+    // 2️⃣ Forward to Admin Dashboard (Cloud Licensing Server)
+    try {
+      await axios.post(`${process.env.ADMIN_SERVER_URL}/api/license/subscription-request`, {
+        userId: id,
+        firstName: first_name,
+        lastName: last_name,
+        email: email,
+        plan: plan,
+        category: req.user.role === 'manager' ? 'company' : 'individual'
+      }, {
+        headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+      });
+      console.log(`✅ Forwarded subscription request to Admin server for ${email}`);
+    } catch (forwardErr) {
+      console.error(`⚠️ Forwarding to Admin failed:`, forwardErr.message);
+      // We still return success if email was sent, as admin can see email
+    }
+
+    res.json({ success: true, message: "Request sent to admin successfully!" });
+  } catch (err) {
+    console.error("Subscription Request Error:", err);
+    res.status(500).json({ error: "Failed to process subscription request" });
+  }
+});
+
 app.get("/api/subscription-status", authenticateToken, (req, res) => {
   res.json({
     success: true,
@@ -3788,7 +3956,7 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     let daysToAdd = 0;
     let planName = "";
 
-    if (key === "CLOUD360-TRIAL") { daysToAdd = 3; planName = "Trial"; }
+    if (key === "CLOUD360-TRIAL") { daysToAdd = 7; planName = "Trial"; }
     else if (key === "CLOUD360-1M") { daysToAdd = 30; planName = "1 Month"; }
     else if (key === "CLOUD360-3M") { daysToAdd = 90; planName = "3 Months"; }
     else if (key === "CLOUD360-6M") { daysToAdd = 180; planName = "6 Months"; }
