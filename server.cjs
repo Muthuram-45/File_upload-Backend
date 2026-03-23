@@ -3962,9 +3962,49 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     else if (key === "CLOUD360-6M") { daysToAdd = 180; planName = "6 Months"; }
     else if (key === "CLOUD360-1Y") { daysToAdd = 365; planName = "1 Year"; }
     else {
-      return res.status(400).json({ error: "Invalid activation key" });
+      // Check with Admin Server for real license keys (e.g., HLYL-PCKL-...)
+      try {
+        const adminRes = await axios.post(`${process.env.ADMIN_SERVER_URL}/api/license/validate`, {
+          subscription_key: key
+        }, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+
+        if (adminRes.data && adminRes.data.status === "active") {
+          // Security: Ensure key belongs to this user
+          if (adminRes.data.email && adminRes.data.email.toLowerCase() !== req.user.email.toLowerCase()) {
+            return res.status(400).json({ error: "This activation key belongs to another account" });
+          }
+
+          planName = adminRes.data.plan;
+          const newExpiry = adminRes.data.valid_until;
+
+          await db.promise().query(
+            "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ?, status = 'ACTIVE' WHERE id = ?",
+            [planName, formatMySQLDate(newExpiry), key, req.user.id]
+          );
+
+          return res.json({
+            success: true,
+            message: `Successfully activated ${planName} plan!`,
+            plan: planName,
+            expiry: newExpiry
+          });
+        } else {
+          return res.status(400).json({ error: "Invalid or expired activation key" });
+        }
+      } catch (adminErr) {
+        const logMsg = `[${new Date().toISOString()}] ❌ Admin activation check failed for key ${key}: ${adminErr.message}\n`;
+        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
+        if (adminErr.response) {
+          const detailMsg = `[${new Date().toISOString()}] Admin Error Status: ${adminErr.response.status}, Data: ${JSON.stringify(adminErr.response.data)}\n`;
+          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), detailMsg);
+        }
+        return res.status(400).json({ error: "Invalid activation key" });
+      }
     }
 
+    // LEGACY: Hardcoded key logic (Additive)
     const [existing] = await db.promise().query(
       "SELECT subscription_expiry FROM users WHERE id = ?", [req.user.id]
     );
@@ -3977,8 +4017,8 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     const newExpiry = new Date(currentExpiry.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
 
     await db.promise().query(
-      "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ? WHERE id = ?",
-      [planName, newExpiry, key, req.user.id]
+      "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ?, status = 'ACTIVE' WHERE id = ?",
+      [planName, formatMySQLDate(newExpiry), key, req.user.id]
     );
 
     res.json({
