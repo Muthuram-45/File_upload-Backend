@@ -18,6 +18,8 @@ const { CohereClient } = require("cohere-ai");
 const cron = require("node-cron");
 const crypto = require("crypto");
 const PDFDocument = require("pdfkit");
+const { initDB } = require('./init_db.cjs');
+
 
 function formatMySQLDate(dateString) {
   if (!dateString) return null;
@@ -138,12 +140,16 @@ if (!fs.existsSync(uploadDir)) {
 // DATABASE CONNECTION
 // =============================
 const db = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: '8080',
-  database: 'file_upload_db',
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'file_upload_db',
+  port: process.env.DB_PORT || 3306,
+  ssl: {
+    rejectUnauthorized: false,
+    ca: fs.readFileSync(path.join(__dirname, process.env.DB_SSL_CA || 'global-bundle.pem'))
+  }
 });
-
 
 const promiseDb = db.promise();
 
@@ -152,27 +158,31 @@ const promiseDb = db.promise();
 // =============================
 (async () => {
   try {
+    // 🚀 Automatically create database and tables if they don't exist
+    await initDB();
+
     const [columns] = await db.promise().query("SHOW COLUMNS FROM users");
+
     const columnNames = columns.map(c => c.Field);
 
     if (!columnNames.includes('subscription_plan')) {
       await db.promise().query("ALTER TABLE users ADD COLUMN subscription_plan VARCHAR(50) DEFAULT 'Trial'");
-      console.log("✅ Added subscription_plan column");
     }
+
     if (!columnNames.includes('subscription_expiry')) {
       // Default trial: 3 days from registration. For existing users, we'll give them 3 days from now.
       await db.promise().query("ALTER TABLE users ADD COLUMN subscription_expiry DATETIME");
-      await db.promise().query("UPDATE users SET subscription_expiry = DATE_ADD(NOW(), INTERVAL 3 DAY) WHERE subscription_expiry IS NULL");
-      console.log("✅ Added subscription_expiry column");
+      await db.promise().query("UPDATE users SET subscription_expiry = DATE_ADD(NOW(), INTERVAL 7 DAY) WHERE subscription_expiry IS NULL");
     }
+
     if (!columnNames.includes('activation_key')) {
       await db.promise().query("ALTER TABLE users ADD COLUMN activation_key VARCHAR(100)");
-      console.log("✅ Added activation_key column");
     }
+
 
     // Ensure status column can hold new values
     await db.promise().query("ALTER TABLE users MODIFY COLUMN status VARCHAR(50) DEFAULT 'ACTIVE'");
-    console.log("✅ Updated status column to VARCHAR(50)");
+
   } catch (err) {
     console.error("❌ Migration Error:", err);
   }
@@ -396,6 +406,7 @@ function detectRoleAndCompany(email) {
 // =============================
 app.post('/register', async (req, res) => {
   try {
+    console.log(`📦 Incoming registration request body: ${JSON.stringify(req.body)}`);
     const { firstName, lastName, email, mobile, password } = req.body;
 
     if (!email || !password) {
@@ -441,10 +452,11 @@ app.post('/register', async (req, res) => {
     const status = 'ACTIVE';
 
     // 💾 INSERT USER
+    console.log(`💾 Inserting user ${normalizedEmail} with mobile: ${mobile || 'EMPTY'}`);
     const [result] = await db.promise().query(
       `INSERT INTO users
        (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
       [
         firstName,
         lastName,
@@ -459,6 +471,7 @@ app.post('/register', async (req, res) => {
         'Asia/Kolkata' // default timezone
       ]
     );
+    console.log(`✅ User inserted with ID: ${result.insertId}`);
 
     const userId = result.insertId;
 
@@ -473,7 +486,7 @@ app.post('/register', async (req, res) => {
         password: password, // Store password in admin if needed, or hash
         user_type: 'client',
         plan: 'Trial',
-        valid_until: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         category: 'individual',
         company_name: null
       }, {
@@ -503,6 +516,7 @@ app.post('/register', async (req, res) => {
 
 app.post('/company-register', async (req, res) => {
   try {
+    console.log(`📦 Incoming company-registration request body: ${JSON.stringify(req.body)}`);
     const { firstName, lastName, email, mobile, password } = req.body;
 
     if (!email || !password) {
@@ -537,10 +551,11 @@ app.post('/company-register', async (req, res) => {
     const status = role === 'employee' ? 'PENDING' : 'ACTIVE';
 
     // 💾 INSERT USER
+    console.log(`💾 Inserting company user ${normalizedEmail} with mobile: ${mobile || 'EMPTY'}`);
     const [result] = await db.promise().query(
       `INSERT INTO users
        (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 3 DAY))`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
       [
         firstName,
         lastName,
@@ -555,6 +570,7 @@ app.post('/company-register', async (req, res) => {
         'Asia/Kolkata' // default timezone
       ]
     );
+    console.log(`✅ Company user inserted with ID: ${result.insertId}`);
 
     const userId = result.insertId;
 
@@ -569,7 +585,7 @@ app.post('/company-register', async (req, res) => {
         password: password,
         user_type: role === 'manager' ? 'admin' : 'client',
         plan: 'Trial',
-        valid_until: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
         category: 'company',
         company_name: company_name
       }, {
@@ -633,17 +649,53 @@ app.get('/approve-employee', async (req, res) => {
     const { token } = req.query;
     const decoded = jwt.verify(token, secret_key);
 
+    // 1. Update local status
     await db.promise().query(
       `UPDATE users SET status = 'ACTIVE'
        WHERE email = ? AND company_name = ?`,
       [decoded.email, decoded.company_name]
     );
 
+    // 2. Fetch user details to sync with Admin
+    const [rows] = await db.promise().query(
+      "SELECT * FROM users WHERE email = ? AND company_name = ?",
+      [decoded.email, decoded.company_name]
+    );
+
+    if (rows.length > 0) {
+      const user = rows[0];
+      try {
+        await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+          id: user.id,
+          firstname: user.first_name,
+          lastname: user.last_name,
+          email: user.email,
+          contact: user.mobile || '',
+          password: 'ApprovedUserSync', // Placeholder since hash is in DB
+          user_type: 'client',
+          plan: 'Trial',
+          valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+          category: 'company',
+          company_name: user.company_name
+        }, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+        console.log(`✅ [Approval Sync] Synced ${user.email} to Admin server`);
+      } catch (syncErr) {
+        console.error(`⚠️ [Approval Sync] Failed for ${user.email}:`, syncErr.message);
+        // We don't fail the approval if sync fails
+      }
+    }
+
     res.send(`
-      <h2>✅ Employee Approved</h2>
-      <p>${decoded.email} can now login.</p>
+      <div style="font-family: sans-serif; text-align: center; padding: 50px;">
+        <h2 style="color: #2e7d32;">✅ Employee Approved Successfully</h2>
+        <p><b>${decoded.email}</b> from <b>${decoded.company_name}</b> can now login to the portal.</p>
+        <p style="margin-top: 20px; color: #666;">You can close this window now.</p>
+      </div>
     `);
   } catch (err) {
+    console.error("Approval Error:", err.message);
     res.status(400).send('Invalid or expired approval link');
   }
 });
@@ -692,7 +744,7 @@ app.post('/login', async (req, res) => {
               adminUser.company_name,
               adminUser.category === 'company' ? 'manager' : 'personal',
               adminUser.plan || 'Trial',
-              adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
+              adminUser.valid_until || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
             ]
           );
 
@@ -714,13 +766,7 @@ app.post('/login', async (req, res) => {
       user = rows[0];
       // 🔄 FULL SYNC: Update user detail and status from Admin
       try {
-        const syncLog = (msg) => {
-          const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
-          console.log(msg);
-          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-        };
-
-        syncLog(`🔄 [Login Sync] Attempting full sync for: ${email}`);
+        console.log(`🔄 [Login Sync] Attempting full sync for: ${email}`);
         const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
           headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
         });
@@ -739,7 +785,10 @@ app.post('/login', async (req, res) => {
             portalStatus = 'ACTIVE';
           }
 
-          syncLog(`📦 [Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+          console.log(`📦 [Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+
+          // 🔥 ONLY OVERWRITE MOBILE IF ADMIN HAS IT
+          const syncMobile = adminUser.contact || user.mobile || '';
 
           await db.promise().query(
             `UPDATE users SET 
@@ -755,7 +804,7 @@ app.post('/login', async (req, res) => {
               formatMySQLDate(adminUser.valid_until),
               adminUser.firstname,
               adminUser.lastname,
-              adminUser.contact || '',
+              syncMobile,
               portalStatus,
               email
             ]
@@ -766,28 +815,14 @@ app.post('/login', async (req, res) => {
           user.subscription_expiry = adminUser.valid_until;
           user.first_name = adminUser.firstname;
           user.last_name = adminUser.lastname;
-          user.mobile = adminUser.contact || '';
+          user.mobile = syncMobile;
           user.status = portalStatus;
 
-          syncLog(`✅ [Login Sync] Full sync completed for ${email}`);
+          console.log(`✅ [Login Sync] Full sync completed for ${email}`);
         }
       } catch (syncErr) {
-        if (syncErr.response && syncErr.response.status === 404) {
-          const syncLog = (msg) => {
-            const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
-            console.log(msg);
-            fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-          };
-          syncLog(`🚨 [Login Sync] User ${email} DELETED remotely. Removing local record.`);
-          await db.promise().query('DELETE FROM users WHERE email = ?', [email]);
-          return res.status(400).json({
-            success: false,
-            error: 'Account no longer exists'
-          });
-        }
-        const errMsg = `❌ [Login Sync] Sync failed for ${email}: ${syncErr.message}`;
-        console.error(errMsg);
-        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), `[${new Date().toISOString()}] ${errMsg}\n`);
+          console.log(`⚠️ [Login Sync] User ${email} not found in Admin server. Preserving local record.`);
+        console.error(`❌ [Login Sync] Sync failed for ${email}: ${syncErr.message}`);
       }
     }
 
@@ -922,7 +957,7 @@ app.post('/company-login', async (req, res) => {
               adminUser.company_name,
               adminUser.category === 'company' ? 'manager' : 'personal',
               adminUser.plan || 'Trial',
-              adminUser.valid_until || new Date(Date.now() + 3 * 24 * 60 * 60 * 1000)
+              adminUser.valid_until || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
             ]
           );
 
@@ -944,13 +979,7 @@ app.post('/company-login', async (req, res) => {
       user = rows[0];
       // 🔄 FULL SYNC: For existing company users
       try {
-        const syncLog = (msg) => {
-          const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
-          console.log(msg);
-          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-        };
-
-        syncLog(`🔄 [Company Login Sync] Attempting sync for: ${email}`);
+        console.log(`🔄 [Company Login Sync] Attempting sync for: ${email}`);
         const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${email}`, {
           headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
         });
@@ -969,7 +998,10 @@ app.post('/company-login', async (req, res) => {
             portalStatus = 'ACTIVE';
           }
 
-          syncLog(`📦 [Company Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+          console.log(`📦 [Company Login Sync] Data: ${JSON.stringify({ plan: adminUser.plan, status: adminUser.status, portalStatus })}`);
+
+          // 🔥 ONLY OVERWRITE MOBILE IF ADMIN HAS IT
+          const syncMobile = adminUser.contact || user.mobile || '';
 
           await db.promise().query(
             `UPDATE users SET 
@@ -985,7 +1017,7 @@ app.post('/company-login', async (req, res) => {
               adminUser.valid_until,
               adminUser.firstname,
               adminUser.lastname,
-              adminUser.contact || '',
+              syncMobile,
               portalStatus,
               email
             ]
@@ -995,30 +1027,19 @@ app.post('/company-login', async (req, res) => {
           user.subscription_expiry = adminUser.valid_until;
           user.first_name = adminUser.firstname;
           user.last_name = adminUser.lastname;
-          user.mobile = adminUser.contact || '';
+          user.mobile = syncMobile;
           user.status = portalStatus;
 
-          syncLog(`✅ [Company Login Sync] Full sync completed for ${email}`);
+          console.log(`✅ [Company Login Sync] Full sync completed for ${email}`);
         } else {
-          syncLog(`⚠️ [Company Login Sync] No data returned from Admin for ${email}`);
+          console.log(`⚠️ [Company Login Sync] No data returned from Admin for ${email}`);
         }
       } catch (syncErr) {
         if (syncErr.response && syncErr.response.status === 404) {
-          const syncLog = (msg) => {
-            const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
-            console.log(msg);
-            fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-          };
-          syncLog(`🚨 [Company Login Sync] User ${email} DELETED remotely. Removing local record.`);
-          await db.promise().query('DELETE FROM users WHERE email = ?', [email]);
-          return res.status(400).json({
-            success: false,
-            error: 'Account no longer exists'
-          });
+          console.log(`⚠️ [Company Login Sync] User ${email} not found in Admin server. Preserving local record.`);
+          // DO NOT DELETE LOCAL USER - Just skip sync
         }
-        const errMsg = `❌ [Company Login Sync] Failed for ${email}: ${syncErr.message}`;
-        console.error(errMsg);
-        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), `[${new Date().toISOString()}] ${errMsg}\n`);
+        console.error(`❌ [Company Login Sync] Failed for ${email}: ${syncErr.message}`);
       }
     }
 
@@ -1268,8 +1289,8 @@ app.post('/google-login', async (req, res) => {
       await db.promise().query(
         `INSERT INTO users
    (first_name, last_name, email, mobile, password,
-    company_name, role, status, last_login)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    company_name, role, status, last_login, subscription_plan, subscription_expiry)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
         [
           firstName,
           lastName,
@@ -1290,6 +1311,28 @@ app.post('/google-login', async (req, res) => {
         .query('SELECT * FROM users WHERE email = ?', [email]);
 
       user = newUser[0];
+
+      // 🔄 Sync with Admin Server
+      try {
+        await axios.post(`${process.env.ADMIN_SERVER_URL}/api/users`, {
+          id: user.id,
+          firstname: firstName,
+          lastname: lastName,
+          email: email,
+          contact: '',
+          password: '', // Google login has no local password
+          user_type: 'client',
+          plan: 'Trial',
+          valid_until: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+          category: 'individual',
+          company_name: null
+        }, {
+          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
+        });
+        console.log(`✅ Synced Google user ${email} (ID: ${user.id}) to Admin server`);
+      } catch (syncErr) {
+        console.error(`⚠️ Sync to Admin failed for Google user ${email}:`, syncErr.message);
+      }
     } else {
       user = existing[0];
       await db
@@ -1331,6 +1374,7 @@ app.post('/google-login', async (req, res) => {
         email: user.email,
         role: user.role,
         company_name: user.company_name || null,
+        mobile: user.mobile,
         picture,
         lastLogin: new Date(),
         subscription_plan: user.subscription_plan || null,
@@ -3944,7 +3988,9 @@ app.get("/api/subscription-status", authenticateToken, (req, res) => {
     plan: req.user.subscription_plan,
     expiry: req.user.subscription_expiry,
     isActive: req.user.isSubscriptionActive,
-    status: req.user.status
+    status: req.user.status,
+    role: req.user.role,
+    company_name: req.user.company_name
   });
 });
 
@@ -3953,83 +3999,44 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     const { key } = req.body;
     if (!key) return res.status(400).json({ error: "Activation key required" });
 
-    let daysToAdd = 0;
-    let planName = "";
-
-    if (key === "CLOUD360-TRIAL") { daysToAdd = 7; planName = "Trial"; }
-    else if (key === "CLOUD360-1M") { daysToAdd = 30; planName = "1 Month"; }
-    else if (key === "CLOUD360-3M") { daysToAdd = 90; planName = "3 Months"; }
-    else if (key === "CLOUD360-6M") { daysToAdd = 180; planName = "6 Months"; }
-    else if (key === "CLOUD360-1Y") { daysToAdd = 365; planName = "1 Year"; }
-    else {
-      // Check with Admin Server for real license keys (e.g., HLYL-PCKL-...)
-      try {
-        const adminRes = await axios.post(`${process.env.ADMIN_SERVER_URL}/api/license/validate`, {
-          subscription_key: key
-        }, {
-          headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
-        });
-
-        if (adminRes.data && adminRes.data.status === "active") {
-          // Security: Ensure key belongs to this user
-          if (adminRes.data.email && adminRes.data.email.toLowerCase() !== req.user.email.toLowerCase()) {
-            return res.status(400).json({ error: "This activation key belongs to another account" });
-          }
-
-          planName = adminRes.data.plan;
-          const newExpiry = adminRes.data.valid_until;
-
-          await db.promise().query(
-            "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ?, status = 'ACTIVE' WHERE id = ?",
-            [planName, formatMySQLDate(newExpiry), key, req.user.id]
-          );
-
-          return res.json({
-            success: true,
-            message: `Successfully activated ${planName} plan!`,
-            plan: planName,
-            expiry: newExpiry
-          });
-        } else {
-          return res.status(400).json({ error: "Invalid or expired activation key" });
-        }
-      } catch (adminErr) {
-        const logMsg = `[${new Date().toISOString()}] ❌ Admin activation check failed for key ${key}: ${adminErr.message}\n`;
-        fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-        if (adminErr.response) {
-          const detailMsg = `[${new Date().toISOString()}] Admin Error Status: ${adminErr.response.status}, Data: ${JSON.stringify(adminErr.response.data)}\n`;
-          fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), detailMsg);
-        }
-        return res.status(400).json({ error: "Invalid activation key" });
-      }
-    }
-
-    // LEGACY: Hardcoded key logic (Additive)
-    const [existing] = await db.promise().query(
-      "SELECT subscription_expiry FROM users WHERE id = ?", [req.user.id]
-    );
-
-    let currentExpiry = new Date();
-    if (existing[0].subscription_expiry && new Date(existing[0].subscription_expiry) > new Date()) {
-      currentExpiry = new Date(existing[0].subscription_expiry);
-    }
-
-    const newExpiry = new Date(currentExpiry.getTime() + daysToAdd * 24 * 60 * 60 * 1000);
-
-    await db.promise().query(
-      "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ?, status = 'ACTIVE' WHERE id = ?",
-      [planName, formatMySQLDate(newExpiry), key, req.user.id]
-    );
-
-    res.json({
-      success: true,
-      message: `Successfully activated ${planName} plan!`,
-      plan: planName,
-      expiry: newExpiry
+    const adminServerUrl = process.env.ADMIN_SERVER_URL || 'http://localhost:5000';
+    
+    console.log(`[Activation] Requesting activation for ${req.user.email} from Admin...`);
+    
+    // Call Admin Server to activate
+    const response = await axios.post(`${adminServerUrl}/api/license/activate`, {
+      email: req.user.email,
+      key: key
+    }, {
+      headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
     });
+
+    if (response.data && response.data.success) {
+      const { plan, valid_until } = response.data;
+
+      // Update local database (File_upload-Backend users table)
+      await db.promise().query(
+        "UPDATE users SET subscription_plan = ?, subscription_expiry = ?, activation_key = ?, status = 'ACTIVE' WHERE id = ?",
+        [plan, formatMySQLDate(valid_until), key, req.user.id]
+      );
+
+      console.log(`✅ [Activation] Successfully activated ${plan} for ${req.user.email}`);
+
+      return res.json({ 
+        success: true, 
+        message: "Subscription activated successfully!",
+        plan: plan,
+        expiry: valid_until
+      });
+    } else {
+      return res.status(400).json({ error: response.data.error || "Activation failed" });
+    }
+
   } catch (err) {
-    console.error("Activation Error:", err);
-    res.status(500).json({ error: "Failed to activate subscription" });
+    console.error("Activation Error:", err.response?.data || err.message);
+    res.status(err.response?.status || 500).json({ 
+      error: err.response?.data?.error || "Failed to connect to licensing server" 
+    });
   }
 });
 
@@ -4047,14 +4054,7 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Log the incoming sync request
-    const syncLog = (msg) => {
-      const logMsg = `[${new Date().toISOString()}] ${msg}\n`;
-      console.log(msg);
-      fs.appendFileSync(path.join(__dirname, 'sync_debug.log'), logMsg);
-    };
-
-    syncLog(`🔄 [Remote Sync] Incoming sync for: ${normalizedEmail}`);
+    console.log(`🔄 [Remote Sync] Incoming sync for: ${normalizedEmail}`);
 
     const adminRes = await axios.get(`${process.env.ADMIN_SERVER_URL}/api/users/check/${normalizedEmail}`, {
       headers: { 'x-api-key': process.env.API_BRIDGE_KEY }
@@ -4063,8 +4063,16 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
     if (adminRes.data) {
       const adminUser = adminRes.data;
 
+      // 🔍 Fetch current local status to preserve PENDING
+      const [localRows] = await db.promise().query(
+        "SELECT status FROM users WHERE email = ?",
+        [normalizedEmail]
+      );
+      const currentLocalStatus = localRows.length > 0 ? localRows[0].status : null;
+
       // Map Admin status to Portal status
-      let portalStatus = 'ACTIVE';
+      let portalStatus = (currentLocalStatus === 'PENDING') ? 'PENDING' : 'ACTIVE';
+      
       const adminStatus = (adminUser.status || '').toLowerCase();
       if (adminStatus === 'inactive') {
         portalStatus = 'INACTIVE';
@@ -4074,25 +4082,25 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
 
       await db.promise().query(
         `UPDATE users SET 
-          subscription_plan = ?, 
-          subscription_expiry = ?, 
           first_name = ?, 
           last_name = ?, 
           mobile = ?, 
-          status = ? 
+          status = ?,
+          subscription_plan = ?,
+          subscription_expiry = ? 
          WHERE email = ?`,
         [
-          adminUser.plan,
-          formatMySQLDate(adminUser.valid_until),
           adminUser.firstname,
           adminUser.lastname,
           adminUser.contact || '',
           portalStatus,
+          adminUser.plan || 'None',
+          adminUser.valid_until ? formatMySQLDate(adminUser.valid_until) : null,
           normalizedEmail
         ]
       );
 
-      syncLog(`✅ [Remote Sync] Successfully updated ${normalizedEmail}`);
+      console.log(`✅ [Remote Sync] Successfully updated ${normalizedEmail}`);
       res.json({ success: true, message: "User synced successfully" });
     } else {
       res.status(404).json({ error: "User not found in Admin server" });
