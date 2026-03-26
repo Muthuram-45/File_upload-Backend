@@ -99,6 +99,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS files (
         id INT AUTO_INCREMENT PRIMARY KEY,
         file_name VARCHAR(255),
+        display_name VARCHAR(255),
         file_path TEXT,
         company_name VARCHAR(255),
         uploaded_by INT,

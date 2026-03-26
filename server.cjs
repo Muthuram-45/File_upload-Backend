@@ -183,6 +183,13 @@ const promiseDb = db.promise();
     // Ensure status column can hold new values
     await db.promise().query("ALTER TABLE users MODIFY COLUMN status VARCHAR(50) DEFAULT 'ACTIVE'");
 
+    const [fileColumns] = await db.promise().query("SHOW COLUMNS FROM files");
+    const fileColumnNames = fileColumns.map(c => c.Field);
+
+    if (!fileColumnNames.includes('display_name')) {
+      await db.promise().query("ALTER TABLE files ADD COLUMN display_name VARCHAR(255) AFTER file_name");
+    }
+
   } catch (err) {
     console.error("❌ Migration Error:", err);
   }
@@ -202,20 +209,19 @@ const promiseDb = db.promise();
 // =============================
 // MULTER SETUP  (NO CHANGES REMOVED)
 // =============================
+// --------------------------------------------------------
+// 🔢 10-Digit ID Generator
+// --------------------------------------------------------
+function generate10DigitID() {
+  return Math.floor(1000000000 + Math.random() * 9000000000).toString();
+}
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
-
-    // 🔥 If front-end sends custom file name => use it
-    const customName = req.body.customFileName;
-
-    if (customName) {
-      return cb(null, customName + path.extname(file.originalname));
-    }
-
-    // Otherwise use your default unique file naming
+    // We'll rename the file after upload in the route handler for more control
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, uniqueSuffix + path.extname(file.originalname));
   },
@@ -2343,35 +2349,43 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
 
     const companyName = req.user?.company_name || null;
     const rawName = req.body.name || "uploaded_file";
-    const baseFileName = safeFileName(rawName);
+    // const baseFileName = safeFileName(rawName);
 
     // ==================================================
     // SINGLE FILE FLOW
     // ==================================================
     if (req.files.length === 1) {
       const file = req.files[0];
-      const finalFilename = `${baseFileName}.csv`;
+      const fileId = generate10DigitID();
+      const finalFilename = `${fileId}.csv`;
       const finalPath = path.join(__dirname, "uploads", finalFilename);
 
       fs.renameSync(file.path, finalPath);
 
-      const [existing] = await db.promise().query(
-        `SELECT id FROM files
-           WHERE file_name = ?
-           AND company_name <=> ?`,
-        [baseFileName, companyName]
-      );
+      // 🔥 CONDITIONAL DUPLICATE CHECK (Company-wide for company users, User-specific for others)
+      let duplicateQuery = "";
+      let duplicateParams = [];
 
+      if (companyName) {
+        duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND company_name = ?`;
+        duplicateParams = [rawName, companyName];
+      } else {
+        duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND uploaded_by = ?`;
+        duplicateParams = [rawName, req.user.id];
+      }
+
+      const [existing] = await db.promise().query(duplicateQuery, duplicateParams);
       const status = existing.length > 0 ? "CANCEL" : "NEW";
 
       await db.promise().query(
-        `INSERT INTO files (file_name, file_path, company_name, uploaded_by, status)
-   VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status)
+   VALUES (?, ?, ?, ?, ?, ?)`,
         [
-          baseFileName,
+          fileId,
+          rawName,
           `/uploads/${finalFilename}`,
           companyName,
-          req.user.id,     // 👈 user_id
+          req.user.id,
           status
         ]
       );
@@ -2380,7 +2394,7 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       try {
         const { data } = await readCSV(finalPath);
         await insertFileRunStat({
-          file_name: baseFileName,
+          file_name: rawName, // Keep original name in reports
           company_name: companyName,
           uploaded_by: req.user.id,
           rows_count: data.length,
@@ -2390,11 +2404,11 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
         console.error("❌ Error logging file stat:", err);
       }
 
-
       return res.json({
         success: true,
         message: "File uploaded successfully",
-        file: finalFilename
+        file: finalFilename,
+        display_name: rawName
       });
     }
 
@@ -2471,41 +2485,56 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       const mergedCSV = parser.parse(Array.from(map.values()));
 
       // 🔥 USE USER FILE NAME
-      let finalFilename = `${baseFileName}.csv`;
-      let finalPath = path.join(__dirname, "uploads", finalFilename);
+      // let finalFilename = `${baseFileName}.csv`; // This was for baseFileName, now using rawName for display_name
+      const tempFilename = `temp_merged_${generate10DigitID()}.csv`; // Use a temp name for writing
+      const tempPath = path.join(__dirname, "uploads", tempFilename);
 
-      // avoid overwrite
-      let counter = 1;
-      while (fs.existsSync(finalPath)) {
-        finalFilename = `${baseFileName}_${counter}.csv`;
-        finalPath = path.join(__dirname, "uploads", finalFilename);
-        counter++;
-      }
-
-      fs.writeFileSync(finalPath, mergedCSV);
+      fs.writeFileSync(tempPath, mergedCSV);
 
       // delete temp uploads
       req.files.forEach(f => {
         if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
       });
 
+      const fileId = generate10DigitID();
+      const finalStoredFilename = `${fileId}.csv`;
+      const finalStoredPath = path.join(__dirname, "uploads", finalStoredFilename);
+      fs.renameSync(tempPath, finalStoredPath);
+
+      // 🔥 CONDITIONAL DUPLICATE CHECK (For Merge)
+      let duplicateQuery = "";
+      let duplicateParams = [];
+
+      if (companyName) {
+        duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND company_name = ?`;
+        duplicateParams = [rawName, companyName];
+      } else {
+        duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND uploaded_by = ?`;
+        duplicateParams = [rawName, req.user.id];
+      }
+
+      const [existing] = await db.promise().query(duplicateQuery, duplicateParams);
+      const status = existing.length > 0 ? "CANCEL" : "NEW";
+
       // save ONLY merged file
       await db.promise().query(
-        `INSERT INTO files (file_name, file_path, company_name, uploaded_by, status)
-   VALUES (?, ?, ?, ?, 'NEW')`,
+        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status)
+   VALUES (?, ?, ?, ?, ?, ?)`,
         [
-          baseFileName,
-          `/uploads/${finalFilename}`,
+          fileId,
+          rawName,
+          `/uploads/${finalStoredFilename}`,
           companyName,
-          req.user.id
+          req.user.id,
+          status
         ]
       );
 
       // 📊 LOG ACTIVITY FOR DAILY REPORT
       try {
-        const { data } = await readCSV(finalPath);
+        const { data } = await readCSV(finalStoredPath);
         await insertFileRunStat({
-          file_name: baseFileName,
+          file_name: rawName,
           company_name: companyName,
           uploaded_by: req.user.id,
           rows_count: data.length,
@@ -2515,11 +2544,11 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
         console.error("❌ Error logging merged file stat:", err);
       }
 
-
       return res.json({
         success: true,
         message: "Files merged successfully",
-        file: finalFilename
+        file: finalStoredFilename,
+        display_name: rawName
       });
     }
 
@@ -2551,7 +2580,8 @@ app.get("/files", authenticateToken, async (req, res) => {
       uploadedQuery = `
         SELECT 
           id,
-          file_name AS name,
+          file_name AS identifier,
+          display_name AS name,
           file_path AS path,
           status,
           processed_at,
@@ -2564,7 +2594,8 @@ app.get("/files", authenticateToken, async (req, res) => {
       uploadedQuery = `
         SELECT 
           id,
-          file_name AS name,
+          file_name AS identifier,
+          display_name AS name,
           file_path AS path,
           status,
           processed_at,
@@ -2579,7 +2610,8 @@ app.get("/files", authenticateToken, async (req, res) => {
 
     const uploadedFilesWithSource = uploadedFiles.map(f => ({
       id: `uploaded-${f.id}`,
-      name: f.name,
+      name: f.name || f.identifier, // Fallback to ID if display_name is null
+      identifier: f.identifier,
       path: f.path,
       status: f.status,
       source: "Uploaded File",
@@ -2625,6 +2657,7 @@ app.get("/files", authenticateToken, async (req, res) => {
     const apiFilesWithSource = apiFiles.map(f => ({
       id: `api-${f.id}`,
       name: f.name,
+      identifier: f.name, // API data name is already unique identifier
       path: f.path,
       source: "API Data",
       type: "api",
@@ -2679,7 +2712,7 @@ app.get("/files", authenticateToken, async (req, res) => {
 
     const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
       id: `processed-${idx}`,
-      folderName: baseName,
+      folderName: baseName, // This will be the 10-digit ID for new files
       tables: processedMap[baseName],
       type: "processed",
       status: "DONE"
@@ -2696,7 +2729,7 @@ app.get("/files", authenticateToken, async (req, res) => {
       name.toLowerCase().replace(/\.[^/.]+$/, "");
 
     const allFiles = [...uploadedFilesWithSource, ...apiFilesWithSource].map(f => {
-      const baseName = getBaseName(f.name);
+      const baseName = getBaseName(f.identifier || f.name);
       let finalStatus = f.status;
 
       if (f.status === "CANCEL") finalStatus = "CANCEL";
@@ -2976,10 +3009,11 @@ app.post("/api/chat", authenticateToken, checkSubscription, async (req, res) => 
     try {
       // Fetch Uploaded Files
       const [files] = await promiseDb.query(
-        `SELECT file_name FROM files WHERE ${company_name ? "company_name = ?" : "uploaded_by = ?"}`,
+        `SELECT file_name, display_name FROM files WHERE ${company_name ? "company_name = ?" : "uploaded_by = ?"}`,
         [company_name || userId]
       );
-      metadata.files = files.map(f => f.file_name);
+      metadata.files = files.map(f => f.display_name || f.file_name);
+      const fileIdentifiers = files.map(f => f.file_name);
 
       // Fetch API Data
       const [apis] = await promiseDb.query(
@@ -2990,7 +3024,7 @@ app.post("/api/chat", authenticateToken, checkSubscription, async (req, res) => 
 
       // Fetch Processed Tables (Authorized)
       const [tables] = await promiseDb.query("SHOW TABLES");
-      const allowedBaseNames = new Set([...metadata.files, ...metadata.apis].map(name => name.toLowerCase().replace(/\.[^/.]+$/, "")));
+      const allowedBaseNames = new Set([...fileIdentifiers, ...metadata.apis].map(name => name.toLowerCase().replace(/\.[^/.]+$/, "")));
 
       metadata.processedTables = tables
         .map(t => Object.values(t)[0])
