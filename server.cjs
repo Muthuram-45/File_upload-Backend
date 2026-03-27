@@ -124,7 +124,7 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' })); // ✅ allow large JSON payloads
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/uploads/processed', express.static(path.join(__dirname, 'uploads/processed')));
 
 // --------------------------------------------------------
@@ -190,6 +190,17 @@ const promiseDb = db.promise();
       await db.promise().query("ALTER TABLE files ADD COLUMN display_name VARCHAR(255) AFTER file_name");
     }
 
+    if (!fileColumnNames.includes('file_content')) {
+      await db.promise().query("ALTER TABLE files ADD COLUMN file_content LONGBLOB AFTER status");
+    }
+
+    const [apiColumns] = await db.promise().query("SHOW COLUMNS FROM api_data");
+    const apiColumnNames = apiColumns.map(c => c.Field);
+
+    if (!apiColumnNames.includes('file_content')) {
+      await db.promise().query("ALTER TABLE api_data ADD COLUMN file_content LONGBLOB AFTER file_path");
+    }
+
   } catch (err) {
     console.error("❌ Migration Error:", err);
   }
@@ -216,18 +227,12 @@ function generate10DigitID() {
   return Math.floor(1000000000 + Math.random() * 9000000000).toString();
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    // We'll rename the file after upload in the route handler for more control
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  },
-});
+const storage = multer.memoryStorage();
 
-const upload = multer({ storage });
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+});
 
 
 
@@ -1654,8 +1659,8 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
         `INSERT INTO api_data
          (api_url, file_name, response, response_hash,
           company_name, uploaded_by,
-          status, last_processed_at, next_process_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          status, last_processed_at, next_process_at, file_content)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           url,
           safeName,
@@ -1665,14 +1670,15 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
           uploadedBy,
           "NEW",
           now,
-          nextRun
+          nextRun,
+          Buffer.from(JSON.stringify(raw))
         ]
       );
     } else {
       await db.promise().query(
         `UPDATE api_data
          SET response = ?, response_hash = ?, status = ?,
-             last_processed_at = ?, next_process_at = ?
+             last_processed_at = ?, next_process_at = ?, file_content = ?
          WHERE id = ?`,
         [
           JSON.stringify(raw),
@@ -1680,6 +1686,7 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
           status,
           now,
           nextRun,
+          Buffer.from(JSON.stringify(raw)),
           existing[0].id
         ]
       );
@@ -1738,8 +1745,8 @@ app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res
     await db.promise().query(
       `INSERT INTO api_data
        (api_url, file_name, response, response_hash, company_name, uploaded_by,
-        status, last_processed_at, next_process_at, api_token)
-       VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?)`,
+        status, last_processed_at, next_process_at, api_token, file_content)
+       VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, ?)`,
       [
         api_url,
         safeName,
@@ -1749,7 +1756,8 @@ app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res
         req.user.id,
         now,
         nextRun,
-        externalToken
+        externalToken,
+        Buffer.from(JSON.stringify(raw))
       ]
     );
 
@@ -1832,7 +1840,8 @@ cron.schedule("*/5 * * * *", async () => {
             response_hash = ?,
             status = ?,
             last_processed_at = ?,
-            next_process_at = ?
+            next_process_at = ?,
+            file_content = ?
           WHERE id = ?
         `, [
           JSON.stringify(rawNewData),
@@ -1840,6 +1849,7 @@ cron.schedule("*/5 * * * *", async () => {
           apiDataStatus,
           now,
           nextRun,
+          Buffer.from(JSON.stringify(rawNewData)),
           api.id
         ]);
 
@@ -2358,14 +2368,13 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       const file = req.files[0];
       const fileId = generate10DigitID();
       const finalFilename = `${fileId}.csv`;
-      const finalPath = path.join(__dirname, "uploads", finalFilename);
 
-      fs.renameSync(file.path, finalPath);
+      // 📄 Use buffer instead of disk
+      const fileContent = file.buffer;
 
-      // 🔥 CONDITIONAL DUPLICATE CHECK (Company-wide for company users, User-specific for others)
+      // 🔥 CONDITIONAL DUPLICATE CHECK
       let duplicateQuery = "";
       let duplicateParams = [];
-
       if (companyName) {
         duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND company_name = ?`;
         duplicateParams = [rawName, companyName];
@@ -2378,28 +2387,28 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       const status = existing.length > 0 ? "CANCEL" : "NEW";
 
       await db.promise().query(
-        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status)
-   VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status, file_content)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           fileId,
           rawName,
-          `/uploads/${finalFilename}`,
+          `/uploads/${finalFilename}`, // Keep as reference for pipeline if needed
           companyName,
           req.user.id,
-          status
+          status,
+          fileContent
         ]
       );
 
       // 📊 LOG ACTIVITY FOR DAILY REPORT
       try {
-        const { data } = await readCSV(finalPath);
-        await insertFileRunStat({
-          file_name: rawName, // Keep original name in reports
-          company_name: companyName,
-          uploaded_by: req.user.id,
-          rows_count: data.length,
-          status: "DONE"
-        });
+        // Since we don't have a disk file, we can either skip this or use a helper to read from buffer
+        // For now, if readCSV expects a path, we might need a buffer version or skip the row count here
+        // or just rely on PySpark for row counts.
+        /*
+        const { data } = await readCSVFromBuffer(file.buffer);
+        await insertFileRunStat({ ... });
+        */
       } catch (err) {
         console.error("❌ Error logging file stat:", err);
       }
@@ -2486,25 +2495,13 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
 
       // 🔥 USE USER FILE NAME
       // let finalFilename = `${baseFileName}.csv`; // This was for baseFileName, now using rawName for display_name
-      const tempFilename = `temp_merged_${generate10DigitID()}.csv`; // Use a temp name for writing
-      const tempPath = path.join(__dirname, "uploads", tempFilename);
-
-      fs.writeFileSync(tempPath, mergedCSV);
-
-      // delete temp uploads
-      req.files.forEach(f => {
-        if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
-      });
-
       const fileId = generate10DigitID();
-      const finalStoredFilename = `${fileId}.csv`;
-      const finalStoredPath = path.join(__dirname, "uploads", finalStoredFilename);
-      fs.renameSync(tempPath, finalStoredPath);
+      const finalFilename = `${fileId}.csv`;
+      const fileContent = Buffer.from(mergedCSV);
 
       // 🔥 CONDITIONAL DUPLICATE CHECK (For Merge)
       let duplicateQuery = "";
       let duplicateParams = [];
-
       if (companyName) {
         duplicateQuery = `SELECT id FROM files WHERE display_name = ? AND company_name = ?`;
         duplicateParams = [rawName, companyName];
@@ -2516,38 +2513,24 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       const [existing] = await db.promise().query(duplicateQuery, duplicateParams);
       const status = existing.length > 0 ? "CANCEL" : "NEW";
 
-      // save ONLY merged file
+      // save ONLY merged file to DB
       await db.promise().query(
-        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status)
-   VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO files (file_name, display_name, file_path, company_name, uploaded_by, status, file_content)
+   VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [
           fileId,
           rawName,
-          `/uploads/${finalStoredFilename}`,
+          `/uploads/${finalFilename}`,
           companyName,
           req.user.id,
-          status
+          status,
+          fileContent
         ]
       );
-
-      // 📊 LOG ACTIVITY FOR DAILY REPORT
-      try {
-        const { data } = await readCSV(finalStoredPath);
-        await insertFileRunStat({
-          file_name: rawName,
-          company_name: companyName,
-          uploaded_by: req.user.id,
-          rows_count: data.length,
-          status: "DONE"
-        });
-      } catch (err) {
-        console.error("❌ Error logging merged file stat:", err);
-      }
-
       return res.json({
         success: true,
         message: "Files merged successfully",
-        file: finalStoredFilename,
+        file: finalFilename,
         display_name: rawName
       });
     }

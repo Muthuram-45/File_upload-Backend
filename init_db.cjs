@@ -73,7 +73,8 @@ async function initDB() {
         last_processed_at DATETIME,
         next_process_at DATETIME,
         api_token TEXT,
-        file_path TEXT
+        file_path TEXT,
+        file_content LONGBLOB
       )
     `);
 
@@ -104,6 +105,7 @@ async function initDB() {
         company_name VARCHAR(255),
         uploaded_by INT,
         status VARCHAR(50),
+        file_content LONGBLOB,
         processed_at DATETIME,
         completed_at DATETIME
       )
