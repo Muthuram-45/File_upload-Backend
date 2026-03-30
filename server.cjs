@@ -109,7 +109,12 @@ admin.initializeApp({
 // =============================
 app.use(cors({
   origin: function (origin, callback) {
-    const allowedOrigins = ["http://localhost:5173", "http://localhost:5174"];
+    const allowedOrigins = [
+      "http://localhost:5173",
+      "http://localhost:5174",
+      process.env.FRONTEND_URL,
+      "https://cloud360-frontend-production.up.railway.app"
+    ].filter(Boolean);
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
@@ -237,12 +242,12 @@ const upload = multer({
 
 
 const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true, // use SSL
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT) || 465,
+  secure: process.env.SMTP_SECURE === 'true', // use SSL
   auth: {
-    user: 'muthuram921@gmail.com',
-    pass: 'clkz ubzz dyjq jwdt', // your app password
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
   },
 });
 
@@ -313,7 +318,7 @@ app.post("/send-otp", async (req, res) => {
     console.log(`📩 OTP ${otp} generated for ${email}`);
 
     await transporter.sendMail({
-      from: '"Cloud360 Verification" <muthuram921@gmail.com>',
+      from: `"Cloud360 Verification" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: "Your OTP Verification Code",
       html: `<h2>${otp}</h2><p>OTP valid for 10 minutes</p>`
@@ -621,9 +626,11 @@ app.post('/company-register', async (req, res) => {
           { expiresIn: '48h' }
         );
 
-        const approveLink = `http://localhost:5000/approve-employee?token=${approveToken}`;
+        const adminUrl = (process.env.ADMIN_SERVER_URL || 'http://localhost:5000').replace(/\/$/, '');
+        const approveLink = `${adminUrl}/approve-employee?token=${approveToken}`;
 
         await transporter.sendMail({
+          from: `"Cloud360 Verification" <${process.env.EMAIL_USER}>`,
           to: managers[0].email,
           subject: 'Employee Approval Required',
           html: `
@@ -1193,7 +1200,8 @@ app.post("/invite-employee", authenticateToken, async (req, res) => {
     );
 
     // 🔗 5️⃣ INVITE LINK
-    const inviteLink = `http://localhost:5173/invite-redirect?token=${inviteToken}`;
+    const frontendUrl = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
+    const inviteLink = `${frontendUrl}/invite-redirect?token=${inviteToken}`;
 
     // 📧 6️⃣ SEND EMAIL
     await transporter.sendMail({
@@ -2257,7 +2265,7 @@ function buildDailySummaryEmail(user, files, apis, apiChanges) {
   <br/>
 
   <p>
-    👉 <a href="http://localhost:5173/dashboard">Open Dashboard</a>
+    👉 <a href="${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/dashboard">Open Dashboard</a>
   </p>
 
   <small>
@@ -2657,25 +2665,30 @@ app.get("/files", authenticateToken, async (req, res) => {
 
     if (isCompanyUser) {
       allowedFilesQuery = `
-        SELECT file_name FROM files WHERE company_name = ?
+        SELECT file_name, display_name FROM files WHERE company_name = ?
         UNION
-        SELECT file_name FROM api_data WHERE company_name = ?`;
+        SELECT file_name, file_name AS display_name FROM api_data WHERE company_name = ?`;
       allowedParams = [company_name, company_name];
     } else {
       allowedFilesQuery = `
-        SELECT file_name FROM files WHERE uploaded_by = ?
+        SELECT file_name, display_name FROM files WHERE uploaded_by = ?
         UNION
-        SELECT file_name FROM api_data WHERE uploaded_by = ?`;
+        SELECT file_name, file_name AS display_name FROM api_data WHERE uploaded_by = ?`;
       allowedParams = [userId, userId];
     }
 
     const [allowedFiles] = await db.promise().query(allowedFilesQuery, allowedParams);
 
-    const allowedBaseNames = new Set(
-      allowedFiles
-        .filter(f => f.file_name)
-        .map(f => f.file_name.toLowerCase().replace(/\.[^/.]+$/, ""))
-    );
+    const displayNameMap = {};
+    const allowedBaseNames = new Set();
+    
+    allowedFiles.forEach(f => {
+      if (f.file_name) {
+        const base = f.file_name.toLowerCase().replace(/\.[^/.]+$/, "").replace(/\s+/g, "_");
+        allowedBaseNames.add(base);
+        displayNameMap[base] = f.display_name || f.file_name;
+      }
+    });
 
     const [tables] = await db.promise().query("SHOW TABLES");
 
@@ -2696,6 +2709,7 @@ app.get("/files", authenticateToken, async (req, res) => {
     const processedFolders = Object.keys(processedMap).map((baseName, idx) => ({
       id: `processed-${idx}`,
       folderName: baseName, // This will be the 10-digit ID for new files
+      display_name: displayNameMap[baseName] || baseName,
       tables: processedMap[baseName],
       type: "processed",
       status: "DONE"
@@ -3306,34 +3320,35 @@ app.post("/nlp/query", authenticateToken, checkSubscription, async (req, res) =>
     // PERSONAL USER
     if (!company_name) {
       allowedQuery = `
-        SELECT file_name FROM files WHERE uploaded_by = ?
+        SELECT file_name, display_name FROM files WHERE uploaded_by = ?
         UNION
-        SELECT file_name FROM api_data WHERE uploaded_by = ?
+        SELECT file_name, file_name AS display_name FROM api_data WHERE uploaded_by = ?
       `;
       params = [userId, userId];
     }
     // COMPANY USER (EMPLOYEE / MANAGER)
     else {
       allowedQuery = `
-        SELECT file_name FROM files WHERE company_name = ?
+        SELECT file_name, display_name FROM files WHERE company_name = ?
         UNION
-        SELECT file_name FROM api_data WHERE company_name = ?
+        SELECT file_name, file_name AS display_name FROM api_data WHERE company_name = ?
       `;
       params = [company_name, company_name];
     }
 
     const [allowedFiles] = await promiseDb.query(allowedQuery, params);
 
-    const allowedBaseNames = new Set(
-      allowedFiles
-        .filter(r => r.file_name)
-        .map(r =>
-          r.file_name
-            .toLowerCase()
-            .replace(/\.[^/.]+$/, "")
-            .replace(/\s+/g, "_")
-        )
-    );
+    const displayNameMap = {};
+    const allowedBaseNames = new Set();
+    
+    allowedFiles.forEach(f => {
+      if (f.file_name) {
+        const base = f.file_name.toLowerCase().replace(/\.[^/.]+$/, "").replace(/\s+/g, "_");
+        allowedBaseNames.add(base);
+        displayNameMap[base] = f.display_name || f.file_name;
+      }
+    });
+
     if (allowedBaseNames.size === 0) {
       return res.json({
         success: true,
@@ -3524,7 +3539,10 @@ User Question:
     if (tablesWithData.length > 1 && !forceMode) {
       return res.json({
         needsUserChoice: true,
-        datasets: tablesWithData
+        datasets: tablesWithData.map(id => ({
+          id,
+          display_name: displayNameMap[id.toLowerCase()] || id
+        }))
       });
     }
 
@@ -3544,7 +3562,8 @@ User Question:
     res.json({
       success: true,
       mode: finalMode,
-      results
+      results,
+      datasetDisplayNames: displayNameMap
     });
 
   } catch (err) {
@@ -4016,7 +4035,7 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     const { key } = req.body;
     if (!key) return res.status(400).json({ error: "Activation key required" });
 
-    const adminServerUrl = process.env.ADMIN_SERVER_URL || 'http://localhost:5000';
+    const adminServerUrl = (process.env.ADMIN_SERVER_URL || 'http://localhost:5000').replace(/\/$/, '');
     
     console.log(`[Activation] Requesting activation for ${req.user.email} from Admin...`);
     
