@@ -28,6 +28,20 @@ function formatMySQLDate(dateString) {
   return date.toISOString().slice(0, 19).replace('T', ' ');
 }
 
+function getNextRunTime(intervalStr) {
+  const now = new Date();
+  if (!intervalStr) return null;
+  if (intervalStr === "5m") return new Date(now.getTime() + 5 * 60 * 1000);
+  if (intervalStr === "10m") return new Date(now.getTime() + 10 * 60 * 1000);
+  if (intervalStr === "30m") return new Date(now.getTime() + 30 * 60 * 1000);
+  if (intervalStr === "1m") return new Date(now.getTime() + 1 * 60 * 1000);
+  if (intervalStr === "1d") return new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  if (intervalStr === "7d") return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+  if (intervalStr === "15d") return new Date(now.getTime() + 15 * 24 * 60 * 60 * 1000);
+  if (intervalStr === "30d") return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  return null;
+}
+
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -113,16 +127,24 @@ app.use(cors({
       "http://localhost:5173",
       "http://localhost:5174",
       process.env.FRONTEND_URL,
-      "https://cloud360-frontend-production.up.railway.app"
+      "https://www.cloud360global.com",
+      "https://cloud360global.com"
     ].filter(Boolean);
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+
+    if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      console.log("Blocked Origin:", origin); // debug
       callback(new Error("Not allowed by CORS"));
     }
   },
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization", "Authorization-External", "x-api-key"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Authorization-External",
+    "x-api-key"
+  ],
   credentials: true
 }));
 
@@ -199,11 +221,29 @@ const promiseDb = db.promise();
       await db.promise().query("ALTER TABLE files ADD COLUMN file_content LONGBLOB AFTER status");
     }
 
-    const [apiColumns] = await db.promise().query("SHOW COLUMNS FROM api_data");
-    const apiColumnNames = apiColumns.map(c => c.Field);
+    if (!fileColumnNames.includes('error_message')) {
+      await db.promise().query("ALTER TABLE files ADD COLUMN error_message TEXT AFTER status");
+    }
 
-    if (!apiColumnNames.includes('file_content')) {
-      await db.promise().query("ALTER TABLE api_data ADD COLUMN file_content LONGBLOB AFTER file_path");
+    if (!fileColumnNames.includes('processed_at')) {
+      await db.promise().query("ALTER TABLE files ADD COLUMN processed_at DATETIME");
+    }
+
+    if (!fileColumnNames.includes('completed_at')) {
+      await db.promise().query("ALTER TABLE files ADD COLUMN completed_at DATETIME");
+    }
+
+    // 🔹 Migration for api_data (api_type and api_interval)
+    const [apiDataCols] = await db.promise().query("SHOW COLUMNS FROM api_data");
+    const apiDataColNames = apiDataCols.map(c => c.Field);
+    if (!apiDataColNames.includes('api_type')) {
+      await db.promise().query("ALTER TABLE api_data ADD COLUMN api_type VARCHAR(50) AFTER api_token");
+    }
+    if (!apiDataColNames.includes('api_interval')) {
+      await db.promise().query("ALTER TABLE api_data ADD COLUMN api_interval VARCHAR(50) AFTER api_type");
+    }
+    if (!apiDataColNames.includes('error_message')) {
+      await db.promise().query("ALTER TABLE api_data ADD COLUMN error_message TEXT AFTER status");
     }
 
   } catch (err) {
@@ -234,7 +274,7 @@ function generate10DigitID() {
 
 const storage = multer.memoryStorage();
 
-const upload = multer({ 
+const upload = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
 });
@@ -391,16 +431,27 @@ app.post("/verify-otp", (req, res) => {
 // gmail detect
 
 function detectRoleAndCompany(email) {
-  const [prefix, domain] = email.toLowerCase().split("@");
+  const normalizedEmail = email.trim().toLowerCase();
 
-  if (["gmail.com", "yahoo.com", "outlook.com"].includes(domain)) {
+  if (!normalizedEmail.includes("@")) {
+    return {
+      role: "invalid",
+      company_name: null
+    };
+  }
+
+  const [prefix, domain] = normalizedEmail.split("@");
+
+  if (["gmail.com", "yahoo.com", "outlook.com", "hotmail.com"].includes(domain)) {
     return {
       role: "personal",
       company_name: null
     };
   }
 
-  const companyName = domain.split(".")[0];
+  const parts = domain.split(".");
+  const rawCompanyName = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+  const companyName = rawCompanyName.toLowerCase().replace(/\s+/g, "").replace(/[^a-z0-9]/g, "");
 
   if (prefix === "manager" || prefix === "admin") {
     return {
@@ -423,7 +474,7 @@ function detectRoleAndCompany(email) {
 app.post('/register', async (req, res) => {
   try {
     console.log(`📦 Incoming registration request body: ${JSON.stringify(req.body)}`);
-    const { firstName, lastName, email, mobile, password } = req.body;
+    const { firstName, lastName, email, mobile, password, timezone } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
@@ -467,12 +518,13 @@ app.post('/register', async (req, res) => {
     const company_name = null;
     const status = 'ACTIVE';
 
+
     // 💾 INSERT USER
     console.log(`💾 Inserting user ${normalizedEmail} with mobile: ${mobile || 'EMPTY'}`);
     const [result] = await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+      (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
       [
         firstName,
         lastName,
@@ -482,9 +534,9 @@ app.post('/register', async (req, res) => {
         company_name,
         role,
         status,
-        9, // report_hour
-        0, // report_minute
-        'Asia/Kolkata' // default timezone
+        9,
+        0,
+        timezone || 'Asia/Kolkata'
       ]
     );
     console.log(`✅ User inserted with ID: ${result.insertId}`);
@@ -533,7 +585,7 @@ app.post('/register', async (req, res) => {
 app.post('/company-register', async (req, res) => {
   try {
     console.log(`📦 Incoming company-registration request body: ${JSON.stringify(req.body)}`);
-    const { firstName, lastName, email, mobile, password } = req.body;
+    const { firstName, lastName, email, mobile, password, timezone } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({
@@ -566,24 +618,25 @@ app.post('/company-register', async (req, res) => {
     // 🔥 STATUS RULE (THIS IS NEW)
     const status = role === 'employee' ? 'PENDING' : 'ACTIVE';
 
+
     // 💾 INSERT USER
     console.log(`💾 Inserting company user ${normalizedEmail} with mobile: ${mobile || 'EMPTY'}`);
     const [result] = await db.promise().query(
       `INSERT INTO users
-       (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+      (first_name, last_name, email, mobile, password, company_name, role, status, report_hour, report_minute, timezone, subscription_plan, subscription_expiry)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Trial', DATE_ADD(NOW(), INTERVAL 7 DAY))`,
       [
         firstName,
         lastName,
-        normalizedEmail, // Changed from email to normalizedEmail for consistency
+        normalizedEmail,
         mobile || '',
         hashedPassword,
         company_name,
         role,
         status,
-        9, // report_hour
-        0, // report_minute
-        'Asia/Kolkata' // default timezone
+        9,
+        0,
+        timezone || 'Asia/Kolkata'
       ]
     );
     console.log(`✅ Company user inserted with ID: ${result.insertId}`);
@@ -721,7 +774,7 @@ app.get('/approve-employee', async (req, res) => {
 
 app.post('/login', async (req, res) => {
   try {
-    let { email, password } = req.body;
+    let { email, password, timezone } = req.body;
     if (email) email = email.trim().toLowerCase();
 
     if (!email || !password) {
@@ -839,7 +892,7 @@ app.post('/login', async (req, res) => {
           console.log(`✅ [Login Sync] Full sync completed for ${email}`);
         }
       } catch (syncErr) {
-          console.log(`⚠️ [Login Sync] User ${email} not found in Admin server. Preserving local record.`);
+        console.log(`⚠️ [Login Sync] User ${email} not found in Admin server. Preserving local record.`);
         console.error(`❌ [Login Sync] Sync failed for ${email}: ${syncErr.message}`);
       }
     }
@@ -875,10 +928,18 @@ app.post('/login', async (req, res) => {
       });
     }
 
-    const now = new Date();
+    const now = new Date().toISOString(); // ✅ FORCE UTC
     await db
       .promise()
-      .query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
+      .query('UPDATE users SET last_login = ? WHERE id = ?', [formatMySQLDate(now), user.id]);
+
+    // ✅ SAVE USER TIMEZONE (ADD THIS BLOCK HERE)
+    if (timezone) {
+      await db.promise().query(
+        'UPDATE users SET timezone = ? WHERE id = ?',
+        [timezone, user.id]
+      );
+    }
 
     // 🔥 JWT WITH ROLE
     const token = jwt.sign(
@@ -930,7 +991,7 @@ app.post('/login', async (req, res) => {
 });
 app.post('/company-login', async (req, res) => {
   try {
-    let { email, password } = req.body;
+    let { email, password, timezone } = req.body;
     if (email) email = email.trim().toLowerCase();
 
     if (!email || !password) {
@@ -1099,10 +1160,17 @@ app.post('/company-login', async (req, res) => {
       });
     }
 
-    const now = new Date();
+    const now = new Date().toISOString(); // ✅ FIX
     await db
       .promise()
-      .query('UPDATE users SET last_login = ? WHERE id = ?', [now, user.id]);
+      .query('UPDATE users SET last_login = ? WHERE id = ?', [formatMySQLDate(now), user.id]);
+
+    if (timezone) {
+      await db.promise().query(
+        'UPDATE users SET timezone = ? WHERE id = ?',
+        [timezone, user.id]
+      );
+    }
 
     // 🔥 JWT WITH ROLE
     const token = jwt.sign(
@@ -1153,8 +1221,6 @@ app.post('/company-login', async (req, res) => {
     });
   }
 });
-
-
 
 app.post("/invite-employee", authenticateToken, async (req, res) => {
   try {
@@ -1651,7 +1717,7 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
       .replace(/[^a-z0-9_]/g, "");
 
     const [existing] = await db.promise().query(
-      `SELECT id, response_hash FROM api_data
+      `SELECT id, response_hash, api_type FROM api_data
        WHERE file_name = ? AND company_name <=> ?`,
       [safeName, companyName]
     );
@@ -1667,8 +1733,8 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
         `INSERT INTO api_data
          (api_url, file_name, response, response_hash,
           company_name, uploaded_by,
-          status, last_processed_at, next_process_at, file_content)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          status, last_processed_at, next_process_at, file_content, completed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           url,
           safeName,
@@ -1679,22 +1745,30 @@ app.post("/fetch-api", authenticateToken, checkSubscription, async (req, res) =>
           "NEW",
           now,
           nextRun,
-          Buffer.from(JSON.stringify(raw))
+          Buffer.from(JSON.stringify(raw)),
+          null
         ]
       );
     } else {
+      const apiType = existing[0].api_type;
+      const finalCompletedAt = (apiType === 'Batch' && status === 'DONE') ? now : null;
+      const finalLastProcessed = apiType === 'Batch' ? null : now;
+      const finalNextProcess = apiType === 'Batch' ? null : nextRun;
+
       await db.promise().query(
         `UPDATE api_data
          SET response = ?, response_hash = ?, status = ?,
-             last_processed_at = ?, next_process_at = ?, file_content = ?
+             last_processed_at = ?, next_process_at = ?, file_content = ?,
+             completed_at = ?
          WHERE id = ?`,
         [
           JSON.stringify(raw),
           hash,
           status,
-          now,
-          nextRun,
+          finalLastProcessed,
+          finalNextProcess,
           Buffer.from(JSON.stringify(raw)),
+          finalCompletedAt,
           existing[0].id
         ]
       );
@@ -1713,7 +1787,7 @@ app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res
       return res.status(403).json({ error: "View-only access" });
     }
 
-    const { api_url, file_name, response } = req.body;
+    const { api_url, file_name, response, api_type, api_interval } = req.body;
     if (!api_url || !file_name || !response) {
       return res.status(400).json({ error: "Missing data" });
     }
@@ -1732,40 +1806,35 @@ app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res
     const hash = stableHash(raw);
 
     const now = new Date();
-    const nextRun = new Date(now.getTime() + 5 * 60 * 1000);
+    const nextRun = getNextRunTime(api_interval) || new Date(now.getTime() + 5 * 60 * 1000);
 
     const externalToken =
       req.headers["authorization-external"] ||
       req.headers["x-api-key"] ||
       null;
 
-    // 🔍 Prevent duplicate API names per company
-    const [existing] = await db.promise().query(
-      `SELECT id FROM api_data WHERE file_name = ? AND company_name <=> ?`,
-      [safeName, req.user.company_name || null]
-    );
-
-    if (existing.length > 0) {
-      return res.status(409).json({ error: "File name already exists" });
-    }
+    const fileId = generate10DigitID();
+    const displayName = file_name.trim();
 
     // 💾 Store RAW JSON + HASH
     await db.promise().query(
       `INSERT INTO api_data
-       (api_url, file_name, response, response_hash, company_name, uploaded_by,
-        status, last_processed_at, next_process_at, api_token, file_content)
-       VALUES (?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, ?)`,
+       (api_url, display_name, file_name, response, response_hash, company_name, uploaded_by,
+        status, last_processed_at, next_process_at, api_token, api_type, api_interval, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'NEW', ?, ?, ?, ?, ?, NULL)`,
       [
         api_url,
-        safeName,
+        displayName,
+        fileId,
         JSON.stringify(raw),
         hash,
         req.user.company_name || null,
         req.user.id,
-        now,
-        nextRun,
+        now,             // base last_processed_at to now for BOTH so it is anchored
+        nextRun,         // next_process_at (For BOTH Batch & Stream)
         externalToken,
-        Buffer.from(JSON.stringify(raw))
+        api_type || 'Batch',
+        api_interval || '1d'
       ]
     );
 
@@ -1779,9 +1848,7 @@ app.post("/save-api-data", authenticateToken, checkSubscription, async (req, res
 // ⏰ API CRON – FINAL & CORRECT
 // =======================================================
 
-cron.schedule("*/5 * * * *", async () => {
-  console.log("⏰ API cron started (every 2 minutes)");
-
+cron.schedule("*/10 * * * * *", async () => {
   try {
     const [apis] = await db.promise().query(`
       SELECT
@@ -1792,16 +1859,21 @@ cron.schedule("*/5 * * * *", async () => {
         api_token,
         file_name,
         company_name,
-        uploaded_by
+        uploaded_by,
+        status,
+        api_type,
+        api_interval
       FROM api_data
+      WHERE next_process_at IS NOT NULL AND next_process_at <= NOW()
     `);
 
-    for (const api of apis) {
+    // ─── Helper: process a single API fetch & DB update ─────────────────────
+    const processSingleApiCron = async (api) => {
       const now = new Date();
-      const nextRun = new Date(now.getTime() + 60 * 60 * 1000);
+      const nextRun = getNextRunTime(api.api_interval) || new Date(now.getTime() + 60 * 60 * 1000);
 
       try {
-        // 1️⃣ FETCH API
+        // 1️⃣ FETCH API (concurrent across batch)
         const headers = { "User-Agent": "Cloud360-Cron/1.0" };
         if (api.api_token) {
           headers.Authorization = api.api_token.startsWith("Bearer ")
@@ -1809,20 +1881,13 @@ cron.schedule("*/5 * * * *", async () => {
             : `Bearer ${api.api_token}`;
         }
 
-        const res = await axios.get(api.api_url, {
-          timeout: 20000,
-          headers
-        });
+        const res = await axios.get(api.api_url, { timeout: 20000, headers });
 
-        const rawNewData = Array.isArray(res.data)
-          ? res.data
-          : [res.data];
+        const rawNewData = Array.isArray(res.data) ? res.data : [res.data];
 
         // 2️⃣ HASH = ONLY SOURCE OF TRUTH
         const newHash = stableHash(rawNewData);
-        const oldHash = api.response_hash;
-
-        const isUpdated = newHash !== oldHash;
+        const isUpdated = newHash !== api.response_hash;
 
         // 3️⃣ ROW COUNTS (REPORTING ONLY)
         let prevRows = 0;
@@ -1832,69 +1897,51 @@ cron.schedule("*/5 * * * *", async () => {
         } catch { }
 
         const currRows = rawNewData.length;
-        const newRows = isUpdated
-          ? Math.max(currRows - prevRows, 0)
-          : 0;
+        const newRows = isUpdated ? Math.max(currRows - prevRows, 0) : 0;
 
-        // 4️⃣ STATUS DECISION
-        const apiDataStatus = isUpdated ? "NEW" : "DONE";
+        // 4️⃣ STATUS DECISION (Safeguard Spark)
+        let apiDataStatus = api.status;
+        if (isUpdated) {
+          if (api.status !== "PROCESSING") apiDataStatus = "NEW";
+        } else {
+          if (api.status !== "NEW" && api.status !== "PROCESSING") apiDataStatus = "DONE";
+        }
+
         const runStatus = isUpdated ? "UPDATED" : "NO_CHANGE";
 
-        // 5️⃣ UPDATE api_data (LATEST SNAPSHOT)
+        // 5️⃣ UPDATE api_data
         await db.promise().query(`
           UPDATE api_data
-          SET
-            response = ?,
-            response_hash = ?,
-            status = ?,
-            last_processed_at = ?,
-            next_process_at = ?,
-            file_content = ?
+          SET response = ?, response_hash = ?, status = ?,
+              last_processed_at = ?, next_process_at = ?, completed_at = ?
           WHERE id = ?
-        `, [
-          JSON.stringify(rawNewData),
-          newHash,
-          apiDataStatus,
-          now,
-          nextRun,
-          Buffer.from(JSON.stringify(rawNewData)),
-          api.id
-        ]);
+        `, [JSON.stringify(rawNewData), newHash, apiDataStatus, now, nextRun, now, api.id]);
 
-        // 6️⃣ INSERT api_run_stats (ALWAYS)
+        // 6️⃣ INSERT api_run_stats
         await db.promise().query(`
           INSERT INTO api_run_stats
-          (
-            api_id,
-            api_name,
-            company_name,
-            uploaded_by,
-            run_time,
-            prev_rows,
-            curr_rows,
-            new_rows,
-            duplicates_removed,
-            status
-          )
+            (api_id, api_name, company_name, uploaded_by, run_time,
+             prev_rows, curr_rows, new_rows, duplicates_removed, status)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-          api.id,
-          api.file_name,
-          api.company_name,
-          api.uploaded_by,
-          now,
-          prevRows,
-          currRows,
-          newRows,
-          0,
-          runStatus
-        ]);
+        `, [api.id, api.file_name, api.company_name, api.uploaded_by,
+          now, prevRows, currRows, newRows, 0, runStatus]);
 
         console.log(`✔ API ${api.file_name} → ${runStatus}`);
 
       } catch (err) {
-        console.error("❌ API fetch failed:", api.api_url, err.message);
+        console.error(`❌ API fetch failed [${api.file_name}]:`, err.message);
       }
+    };
+
+    // 🔥 PARALLEL BATCH PROCESSING — 20 APIs fetched concurrently at a time
+    // This ensures 500 due APIs are handled in ~500ms * ceil(500/20) = ~12.5s
+    // instead of 500 * 500ms = 250 seconds sequentially.
+    const BATCH_SIZE = 20;
+    for (let i = 0; i < apis.length; i += BATCH_SIZE) {
+      const batch = apis.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(batch.map(api => processSingleApiCron(api)));
+      const failed = results.filter(r => r.status === "rejected").length;
+      if (failed > 0) console.warn(`⚠️ Batch [${i}–${i + batch.length}]: ${failed} failed.`);
     }
 
   } catch (err) {
@@ -1963,7 +2010,6 @@ app.get("/api/report-time/:email", async (req, res) => {
 // Runs Every Minute
 // =======================================================
 cron.schedule("* * * * *", async () => {
-  console.log("⏰ Checking Daily Report Schedule...");
 
   try {
     const [users] = await db.promise().query(`
@@ -2365,6 +2411,18 @@ app.post("/upload", authenticateToken, checkSubscription, (req, res, next) => {
       });
     }
 
+    // ✅ VALIDATE FILE FORMATS (ONLY CSV, EXCEL)
+    const allowedExtensions = [".csv", ".xlsx", ".xls"];
+    for (const file of req.files) {
+      const ext = path.extname(file.originalname).toLowerCase();
+      if (!allowedExtensions.includes(ext)) {
+        return res.status(400).json({
+          success: false,
+          error: "Please upload valid dataset to process like csv, excel files. Your uploaded files are not meaningful so we can't process the file. Thank you."
+        });
+      }
+    }
+
     const companyName = req.user?.company_name || null;
     const rawName = req.body.name || "uploaded_file";
     // const baseFileName = safeFileName(rawName);
@@ -2575,6 +2633,7 @@ app.get("/files", authenticateToken, async (req, res) => {
           display_name AS name,
           file_path AS path,
           status,
+          error_message,
           processed_at,
           completed_at
         FROM files
@@ -2589,6 +2648,7 @@ app.get("/files", authenticateToken, async (req, res) => {
           display_name AS name,
           file_path AS path,
           status,
+          error_message,
           processed_at,
           completed_at
         FROM files
@@ -2605,6 +2665,7 @@ app.get("/files", authenticateToken, async (req, res) => {
       identifier: f.identifier,
       path: f.path,
       status: f.status,
+      error_message: f.error_message,
       source: "Uploaded File",
       type: "uploaded",
       processed_at: f.processed_at,
@@ -2621,11 +2682,14 @@ app.get("/files", authenticateToken, async (req, res) => {
       apiQuery = `
         SELECT 
           id,
-          COALESCE(file_name, CONCAT('api_', id)) AS name,
-          file_path AS path,
+          display_name AS name,
+          file_name AS identifier,
           status,
+          api_type,
+          error_message,
           last_processed_at,
-          next_process_at
+          next_process_at,
+          completed_at
         FROM api_data
         WHERE company_name = ?`;
       apiParams = [company_name];
@@ -2633,11 +2697,14 @@ app.get("/files", authenticateToken, async (req, res) => {
       apiQuery = `
         SELECT 
           id,
-          COALESCE(file_name, CONCAT('api_', id)) AS name,
-          file_path AS path,
+          display_name AS name,
+          file_name AS identifier,
           status,
+          api_type,
+          error_message,
           last_processed_at,
-          next_process_at
+          next_process_at,
+          completed_at
         FROM api_data
         WHERE uploaded_by = ?`;
       apiParams = [userId];
@@ -2648,13 +2715,16 @@ app.get("/files", authenticateToken, async (req, res) => {
     const apiFilesWithSource = apiFiles.map(f => ({
       id: `api-${f.id}`,
       name: f.name,
-      identifier: f.name, // API data name is already unique identifier
-      path: f.path,
+      identifier: f.identifier,
+      path: null,
       source: "API Data",
       type: "api",
       status: f.status || "DONE",
+      api_type: f.api_type, // Ensure this is sent
+      error_message: f.error_message,
       last_processed_at: f.last_processed_at,
-      next_process_at: f.next_process_at
+      next_process_at: f.next_process_at,
+      completed_at: f.completed_at
     }));
 
     // =============================
@@ -2667,13 +2737,13 @@ app.get("/files", authenticateToken, async (req, res) => {
       allowedFilesQuery = `
         SELECT file_name, display_name FROM files WHERE company_name = ?
         UNION
-        SELECT file_name, file_name AS display_name FROM api_data WHERE company_name = ?`;
+        SELECT file_name, display_name FROM api_data WHERE company_name = ?`;
       allowedParams = [company_name, company_name];
     } else {
       allowedFilesQuery = `
         SELECT file_name, display_name FROM files WHERE uploaded_by = ?
         UNION
-        SELECT file_name, file_name AS display_name FROM api_data WHERE uploaded_by = ?`;
+        SELECT file_name, display_name FROM api_data WHERE uploaded_by = ?`;
       allowedParams = [userId, userId];
     }
 
@@ -2681,7 +2751,7 @@ app.get("/files", authenticateToken, async (req, res) => {
 
     const displayNameMap = {};
     const allowedBaseNames = new Set();
-    
+
     allowedFiles.forEach(f => {
       if (f.file_name) {
         const base = f.file_name.toLowerCase().replace(/\.[^/.]+$/, "").replace(/\s+/g, "_");
@@ -2918,11 +2988,13 @@ app.get("/dashboard-counts", authenticateToken, async (req, res) => {
     );
 
     // =============================
-    // 4️⃣ MY PROCESSED FILES
+    // 4️⃣ MY PROCESSED FILES & APIs
     // =============================
     const [myNames] = await promiseDb.query(
-      `SELECT file_name FROM files WHERE uploaded_by = ?`,
-      [userId]
+      `SELECT file_name FROM files WHERE uploaded_by = ?
+       UNION
+       SELECT file_name FROM api_data WHERE uploaded_by = ?`,
+      [userId, userId]
     );
 
     const myProcessed = myNames.filter(f =>
@@ -3340,7 +3412,7 @@ app.post("/nlp/query", authenticateToken, checkSubscription, async (req, res) =>
 
     const displayNameMap = {};
     const allowedBaseNames = new Set();
-    
+
     allowedFiles.forEach(f => {
       if (f.file_name) {
         const base = f.file_name.toLowerCase().replace(/\.[^/.]+$/, "").replace(/\s+/g, "_");
@@ -4036,9 +4108,9 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
     if (!key) return res.status(400).json({ error: "Activation key required" });
 
     const adminServerUrl = (process.env.ADMIN_SERVER_URL || 'http://localhost:5000').replace(/\/$/, '');
-    
+
     console.log(`[Activation] Requesting activation for ${req.user.email} from Admin...`);
-    
+
     // Call Admin Server to activate
     const response = await axios.post(`${adminServerUrl}/api/license/activate`, {
       email: req.user.email,
@@ -4058,8 +4130,8 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
 
       console.log(`✅ [Activation] Successfully activated ${plan} for ${req.user.email}`);
 
-      return res.json({ 
-        success: true, 
+      return res.json({
+        success: true,
         message: "Subscription activated successfully!",
         plan: plan,
         expiry: valid_until
@@ -4070,8 +4142,8 @@ app.post("/api/activate-subscription", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("Activation Error:", err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ 
-      error: err.response?.data?.error || "Failed to connect to licensing server" 
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data?.error || "Failed to connect to licensing server"
     });
   }
 });
@@ -4108,7 +4180,7 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
 
       // Map Admin status to Portal status
       let portalStatus = (currentLocalStatus === 'PENDING') ? 'PENDING' : 'ACTIVE';
-      
+
       const adminStatus = (adminUser.status || '').toLowerCase();
       if (adminStatus === 'inactive') {
         portalStatus = 'INACTIVE';
@@ -4149,7 +4221,7 @@ app.post("/api/sync-user-from-admin", async (req, res) => {
 
 
 // =============================
-// START SERVER
+// START SERVER                             
 // =============================
 
 app.listen(port, () => console.log(`🚀 Server running on http://localhost:${port}`));

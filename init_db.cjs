@@ -64,17 +64,19 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS api_data (
         id INT AUTO_INCREMENT PRIMARY KEY,
         api_url TEXT,
+        display_name VARCHAR(255),
         file_name VARCHAR(255),
         response LONGTEXT,
         response_hash VARCHAR(255),
         company_name VARCHAR(255),
         uploaded_by INT,
         status VARCHAR(50),
+        error_message TEXT,
         last_processed_at DATETIME,
         next_process_at DATETIME,
         api_token TEXT,
-        file_path TEXT,
-        file_content LONGBLOB
+        api_type VARCHAR(50),
+        completed_at DATETIME
       )
     `);
 
@@ -105,6 +107,7 @@ async function initDB() {
         company_name VARCHAR(255),
         uploaded_by INT,
         status VARCHAR(50),
+        error_message TEXT,
         file_content LONGBLOB,
         processed_at DATETIME,
         completed_at DATETIME
@@ -130,4 +133,3 @@ if (require.main === module) {
     process.exit(1);
   });
 }
-
